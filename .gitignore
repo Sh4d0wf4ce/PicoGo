@@ -1,0 +1,44 @@
+# Foldery kompilacji CMake i C++ (w każdym podkatalogu)
+build/
+**/build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+build.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+znane_roboty.json
+
+# Pliki automatycznie generowane przez Qt (MOC / UIC / RCC)
+*_autogen/
+.qt/
+*.moc
+ui_*.h
+qrc_*.cpp
+
+# Pliki wykonywalne i biblioteki DLL na Windowsie
+*.exe
+*.dll
+*.obj
+*.o
+*.a
+*.lib
+*.pdb
+
+# Konfiguracja IDE (VS Code, Visual Studio, CLion)
+.vscode/
+.idea/
+*.sln
+*.vcxproj*
+
+# Cache Pythona i Thonny
+__pycache__/
+*.py[cod]
+.thonny/
+
+# Pliki systemowe
+Thumbs.db
+.DS_Store
