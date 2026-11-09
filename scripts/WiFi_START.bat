@@ -8,7 +8,7 @@ if %errorLevel% neq 0 (
 
 echo === [TRYB ROBOTY - WI-FI] KONFIGURACJA KARTY BEZPRZEWODOWEJ ===
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$w = Get-NetAdapter -Physical | Where-Object { $_.PhysicalMediaType -match '802.11|Wireless|Native' -or $_.MediaType -match '802.11' } | Select-Object -First 1; if ($w) { Write-Host ('Znaleziono karte Wi-Fi: ' + $w.Name) -ForegroundColor Cyan; netsh interface ipv4 set address name=\"$($w.Name)\" static 192.168.1.1 255.255.255.0 none; Write-Host 'SUKCES: Ustawiono statyczny adres IP 192.168.1.1 na Wi-Fi.' -ForegroundColor Green } else { Write-Host 'BLAD: Nie wykryto karty Wi-Fi!' -ForegroundColor Red }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$w = Get-NetAdapter -Physical | Where-Object { $_.PhysicalMediaType -match '802.11|Wireless|Native' -or $_.MediaType -match '802.11' } | Select-Object -First 1; if ($w) { Write-Host ('Znaleziono karte Wi-Fi: ' + $w.Name + ' (Status: ' + $w.Status + ')') -ForegroundColor Cyan; Set-NetIPInterface -InterfaceIndex $w.ifIndex -AddressFamily IPv4 -Dhcp Disabled -PolicyStore PersistentStore -ErrorAction SilentlyContinue; Set-NetIPInterface -InterfaceIndex $w.ifIndex -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue; netsh interface ipv4 set address name=\"$($w.Name)\" source=static address=192.168.1.1 mask=255.255.255.0 store=persistent; Write-Host 'SUKCES: Zapisano na stale adres IP 192.168.1.1 na karcie Wi-Fi!' -ForegroundColor Green } else { Write-Host 'BLAD: Nie wykryto karty Wi-Fi!' -ForegroundColor Red }"
 
 netsh advfirewall firewall delete rule name="PicoGo_Panel" >nul 2>&1
 netsh advfirewall firewall add rule name="PicoGo_Panel" dir=in action=allow protocol=UDP localport=67,68,5005,5006 >nul
