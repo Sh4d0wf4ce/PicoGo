@@ -19,6 +19,15 @@
 #include <QRegularExpression>
 #include <QtEndian>
 
+// Podpowiedź do logu, gdy nie udało się otworzyć portu. Na komputerach z Hyper-V, WSL2
+// lub Dockerem Windows rezerwuje losowe zakresy portów: bind kończy się wtedy błędem,
+// mimo że żaden proces portu nie zajmuje.
+static QString portHint(const QString &proto, quint16 port) {
+    return QString("   Sprawdź, kto trzyma port: netstat -ano | findstr :%1\n"
+                   "   Jeśli nikt, port jest zarezerwowany przez Windows (Hyper-V/WSL/Docker): "
+                   "netsh interface ipv4 show excludedportrange protocol=%2").arg(port).arg(proto);
+}
+
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     setWindowTitle("PicoGo Control Panel");
     resize(1220, 660);
@@ -37,7 +46,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
         connect(udpListenSocket, &QUdpSocket::readyRead, this, &MainWindow::onUdpReadyRead);
         logMessage(QString("Nasłuch telemetrii UDP uruchomiony na porcie %1.").arg(UDP_LISTEN_PORT));
     } else {
-        logMessage(QString("BŁĄD: Nie można otworzyć portu UDP %1!").arg(UDP_LISTEN_PORT));
+        logMessage(QString("BŁĄD: Nie można otworzyć portu UDP %1 (%2) – telemetria robotów nie będzie widoczna.")
+                       .arg(UDP_LISTEN_PORT).arg(udpListenSocket->errorString()));
+        logMessage(portHint("udp", UDP_LISTEN_PORT));
     }
 
     // 2. Gniazdo wysyłające rozkazy (Port UDP 5005)
@@ -49,7 +60,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
         connect(httpOtaServer, &QTcpServer::newConnection, this, &MainWindow::onNewHttpConnection);
         logMessage(QString("Serwer HTTP OTA uruchomiony na porcie TCP %1.").arg(HTTP_OTA_PORT));
     } else {
-        logMessage(QString("BŁĄD: Port TCP %1 jest zajęty!").arg(HTTP_OTA_PORT));
+        logMessage(QString("BŁĄD: Nie można otworzyć portu TCP %1 (%2) – aktualizacje OTA nie będą działać.")
+                       .arg(HTTP_OTA_PORT).arg(httpOtaServer->errorString()));
+        logMessage(portHint("tcp", HTTP_OTA_PORT));
     }
 
     // 4. Wbudowany serwer DHCP w tle (Port UDP 67)
