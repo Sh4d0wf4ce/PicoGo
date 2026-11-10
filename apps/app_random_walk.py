@@ -140,6 +140,7 @@ def run():
     sock.setblocking(False)
 
     last_heartbeat = 0
+    last_seq = None
     server_ip = '255.255.255.255'
 
     d = 100.0
@@ -175,6 +176,15 @@ def run():
                     data, addr = sock.recvfrom(512)
                     server_ip = addr[0]
                     msg = json.loads(data.decode('utf-8'))
+
+                    # Ta sama komenda moze dotrzec kilka razy (broadcast + unicast):
+                    # powtorke o tym samym numerze "seq" pomijamy.
+                    seq = msg.get("seq")
+                    if seq is not None:
+                        if seq == last_seq:
+                            continue
+                        last_seq = seq
+
                     cmd = msg.get("cmd")
 
                     if cmd == "OTA_UPDATE":

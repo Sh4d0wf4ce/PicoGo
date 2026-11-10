@@ -23,6 +23,10 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     setWindowTitle("PicoGo Control Panel");
     resize(1220, 660);
 
+    // Numeracja komend zaczyna się od czasu startu, żeby po restarcie panelu
+    // pierwsza komenda nie miała numeru, który robot już widział.
+    commandSeq = static_cast<quint32>(QDateTime::currentSecsSinceEpoch() & 0x3fffffff);
+
     loadRobotDatabase();
     setupMenuBar();
     setupUi();
@@ -657,7 +661,12 @@ QList<QString> MainWindow::getTargetUids(bool forceAll) const {
 }
 
 void MainWindow::sendJsonToTargets(const QJsonObject &payload, bool forceAll) {
-    QByteArray raw = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    // W trybie "cała flota" ta sama komenda idzie do robota kilkoma drogami
+    // (broadcast ogólny, broadcast podsieci, unicast). Numer "seq" pozwala
+    // robotowi wykonać ją tylko raz (np. jeden SPIN zamiast trzech).
+    QJsonObject stamped = payload;
+    stamped["seq"] = static_cast<qint64>(++commandSeq);
+    QByteArray raw = QJsonDocument(stamped).toJson(QJsonDocument::Compact);
 
     if (forceAll || radioTargetAll->isChecked()) {
         sendRawUdp(raw, "255.255.255.255");

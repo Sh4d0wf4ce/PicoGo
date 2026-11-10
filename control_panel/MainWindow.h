@@ -110,6 +110,7 @@ private:
     int nextDhcpOctet = 10;
     bool updatingTableProgrammatically = false;
     int otaDownloadsCount = 0;
+    quint32 commandSeq = 0;
 
     // Ustawienia serwera DHCP
     QAction *actDhcpEnable = nullptr;
