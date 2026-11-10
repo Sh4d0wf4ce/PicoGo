@@ -66,7 +66,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 void MainWindow::setupMenuBar() {
     QMenu *netMenu = menuBar()->addMenu("⚙ Sieć i DHCP");
 
-    actDhcpEnable = new QAction("Włącz wbudowany serwer DHCP w tle (Pula 192.168.1.10 - .250)", this);
+    actDhcpEnable = new QAction("Włącz wbudowany serwer DHCP w tle (Pula " + SUBNET_PREFIX + "10 - .250)", this);
     actDhcpEnable->setCheckable(true);
     actDhcpEnable->setChecked(true);
     connect(actDhcpEnable, &QAction::toggled, this, &MainWindow::toggleDhcpServer);
@@ -288,7 +288,8 @@ void MainWindow::setupUi() {
 void MainWindow::toggleDhcpServer(bool enabled) {
     if (enabled) {
         if (udpDhcpSocket->bind(QHostAddress::AnyIPv4, DHCP_SERVER_PORT, QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
-            logMessage("[DHCP] Serwer DHCP działa w tle na porcie UDP 67 (Pula: 192.168.1.10 - .250).");
+            logMessage("[DHCP] Serwer DHCP działa w tle na porcie UDP 67 (Pula: " + SUBNET_PREFIX + "10 - .250).");
+            checkNetworkSetup();
         } else {
             logMessage("[DHCP BŁĄD] Port UDP 67 zajęty! Uruchom jako Administrator lub wyłącz inny serwer DHCP.");
             actDhcpEnable->setChecked(false);
@@ -299,20 +300,75 @@ void MainWindow::toggleDhcpServer(bool enabled) {
     }
 }
 
-bool MainWindow::isAllowedDeviceMac(const QString &mac) const {
-    if (!actMacFilter->isChecked()) return true;
+// Pule OUI trzymane w jednym miejscu (używane przez filtr i przez przydział adresu AP).
+static const QStringList kRaspberryPiOui = {
+    "2c:cf:67", "28:cd:c1", "d8:3a:dd", "dc:a6:32", "e4:5f:01", "b8:27:eb"
+};
+static const QStringList kUbiquitiOui = {
+    "6c:63:f8", "74:83:c2", "f0:9f:c2", "b4:fb:e4", "24:5a:4c", "80:2a:a8"
+};
 
-    // Odrzucanie losowych adresów MAC ze smartfonów (drugi znak: 2, 6, a, e)
-    // oraz akceptacja oficjalnych pul OUI dla Raspberry Pi oraz Ubiquiti
-    static const QStringList allowedPrefixes = {
-        "2c:cf:67", "28:cd:c1", "d8:3a:dd", "dc:a6:32", "e4:5f:01", "b8:27:eb", // Raspberry Pi
-        "6c:63:f8", "74:83:c2", "f0:9f:c2", "b4:fb:e4", "24:5a:4c", "80:2a:a8"  // Ubiquiti
-    };
-    for (const QString &prefix : allowedPrefixes) {
+static bool macHasPrefix(const QString &mac, const QStringList &prefixes) {
+    for (const QString &prefix : prefixes) {
         if (mac.startsWith(prefix, Qt::CaseInsensitive))
             return true;
     }
     return false;
+}
+
+bool MainWindow::isAllowedDeviceMac(const QString &mac) const {
+    if (!actMacFilter->isChecked()) return true;
+
+    // Akceptowane są tylko oficjalne pule OUI Raspberry Pi oraz Ubiquiti
+    // (telefony i inne urządzenia są ignorowane).
+    return macHasPrefix(mac, kRaspberryPiOui) || macHasPrefix(mac, kUbiquitiOui);
+}
+
+// Szuka karty sieciowej komputera, na której ustawiono adres serwera (SERVER_ETH_IP).
+bool MainWindow::findServerInterface(QNetworkAddressEntry *entry) const {
+    for (const QNetworkInterface &iface : QNetworkInterface::allInterfaces()) {
+        if (!(iface.flags() & QNetworkInterface::IsUp)) continue;
+        for (const QNetworkAddressEntry &e : iface.addressEntries()) {
+            if (e.ip().protocol() == QAbstractSocket::IPv4Protocol && e.ip().toString() == SERVER_ETH_IP) {
+                if (entry) *entry = e;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Wypisuje w logu ostrzeżenia o konfiguracji kart, przy której roboty nie dostaną adresu
+// albo ruch do nich pójdzie złą kartą.
+void MainWindow::checkNetworkSetup() {
+    int owners = 0;
+    QStringList sameSubnet;
+    for (const QNetworkInterface &iface : QNetworkInterface::allInterfaces()) {
+        if (!(iface.flags() & QNetworkInterface::IsUp)) continue;
+        for (const QNetworkAddressEntry &e : iface.addressEntries()) {
+            if (e.ip().protocol() != QAbstractSocket::IPv4Protocol) continue;
+            const QString ip = e.ip().toString();
+            if (ip == SERVER_ETH_IP)
+                owners++;
+            else if (ip.startsWith(SUBNET_PREFIX))
+                sameSubnet << QString("%1 (%2)").arg(iface.humanReadableName(), ip);
+        }
+    }
+
+    if (owners == 0) {
+        logMessage(QString("[SIEĆ UWAGA] Żadna aktywna karta nie ma adresu %1 – roboty nie dostaną IP. "
+                           "Uruchom scripts/Ethernet_START.bat lub WiFi_START.bat i włącz DHCP ponownie.")
+                       .arg(SERVER_ETH_IP));
+    } else if (owners > 1) {
+        logMessage(QString("[SIEĆ UWAGA] Adres %1 jest ustawiony na %2 kartach naraz – ruch do robotów może "
+                           "iść złą kartą. Uruchom skrypt RESET dla nieużywanej karty.")
+                       .arg(SERVER_ETH_IP).arg(owners));
+    }
+    if (!sameSubnet.isEmpty()) {
+        logMessage(QString("[SIEĆ UWAGA] Inna karta jest w tej samej podsieci co roboty: %1. "
+                           "Rozłącz ją albo zmień podsieć robotów.")
+                       .arg(sameSubnet.join(", ")));
+    }
 }
 
 QString MainWindow::allocateIpForMac(const QString &mac) {
@@ -320,10 +376,9 @@ QString MainWindow::allocateIpForMac(const QString &mac) {
         return macToIp[mac];
     }
 
-    if (mac.startsWith("6c:63:f8") || mac.startsWith("74:83:c2") ||
-        mac.startsWith("f0:9f:c2") || mac.startsWith("b4:fb:e4") ||
-        mac.startsWith("24:5a:4c") || mac.startsWith("80:2a:a8")) {
-        QString apIp = "192.168.1.10";
+    // Access point dostaje stały adres .10 (drugi AP trafia do zwykłej puli).
+    const QString apIp = SUBNET_PREFIX + "10";
+    if (macHasPrefix(mac, kUbiquitiOui) && !macToIp.values().contains(apIp)) {
         macToIp[mac] = apIp;
         saveRobotDatabase();
         refreshTableStatus();
@@ -336,11 +391,18 @@ QString MainWindow::allocateIpForMac(const QString &mac) {
 
     QString assignedIp;
     while (nextDhcpOctet < 250) {
-        QString candidate = QString("192.168.1.%1").arg(nextDhcpOctet++);
+        QString candidate = SUBNET_PREFIX + QString::number(nextDhcpOctet++);
         if (!macToIp.values().contains(candidate)) {
             assignedIp = candidate;
             break;
         }
+    }
+
+    if (assignedIp.isEmpty()) {
+        // Pula wyczerpana: nie zapisujemy pustej dzierżawy i nie odpowiadamy klientowi.
+        logMessage(QString("[DHCP BŁĄD] Pula adresów wyczerpana – brak IP dla %1. "
+                           "Usuń stare wpisy z pliku %2.").arg(mac, DB_FILENAME));
+        return QString();
     }
 
     macToIp[mac] = assignedIp;
@@ -373,10 +435,17 @@ void MainWindow::onDhcpReadyRead() {
 
         // Filtr ignorujący telefony i obce urządzenia
         if (!isAllowedDeviceMac(macStr)) {
+            if (!rejectedMacsLogged.contains(macStr)) {
+                rejectedMacsLogged.insert(macStr);
+                logMessage(QString("[DHCP] Zignorowano urządzenie spoza filtra MAC: %1 "
+                                   "(jeśli to robot lub AP, wyłącz filtr w menu Sieć i DHCP).").arg(macStr));
+            }
             continue;
         }
 
         quint8 dhcpMsgType = 0;
+        bool hasServerId = false;
+        quint32 requestedServerId = 0;
         int idx = 240;
         while (idx < req.size()) {
             quint8 opt = static_cast<quint8>(req[idx++]);
@@ -387,6 +456,9 @@ void MainWindow::onDhcpReadyRead() {
             if (idx + len > req.size()) break;
             if (opt == 53 && len >= 1) {
                 dhcpMsgType = static_cast<quint8>(req[idx]);
+            } else if (opt == 54 && len == 4) {
+                hasServerId = true;
+                requestedServerId = qFromBigEndian<quint32>(reinterpret_cast<const uchar *>(req.constData() + idx));
             }
             idx += len;
         }
@@ -394,7 +466,13 @@ void MainWindow::onDhcpReadyRead() {
         if (dhcpMsgType != 1 && dhcpMsgType != 3)
             continue;
 
+        // REQUEST skierowany do innego serwera DHCP nie jest dla nas.
+        if (dhcpMsgType == 3 && hasServerId && requestedServerId != QHostAddress(SERVER_ETH_IP).toIPv4Address())
+            continue;
+
         QString clientIpStr = allocateIpForMac(macStr);
+        if (clientIpStr.isEmpty())
+            continue;
         quint32 clientIpInt = qToBigEndian(QHostAddress(clientIpStr).toIPv4Address());
         quint32 serverIpInt = qToBigEndian(QHostAddress(SERVER_ETH_IP).toIPv4Address());
         quint32 maskInt     = qToBigEndian(QHostAddress("255.255.255.0").toIPv4Address());
@@ -440,6 +518,16 @@ void MainWindow::onDhcpReadyRead() {
 
         resp.append(static_cast<char>(255));
 
+        // Część klientów odrzuca pakiety BOOTP krótsze niż 300 bajtów.
+        if (resp.size() < 300)
+            resp.append(QByteArray(300 - resp.size(), 0));
+
+        // Windows wysyła 255.255.255.255 tylko jedną kartą (o najniższej metryce), więc przy
+        // dwóch aktywnych kartach odpowiedź mogła nie trafić do robotów. Broadcast podsieci
+        // jest kierowany tablicą routingu na kartę z adresem serwera.
+        QNetworkAddressEntry serverEntry;
+        if (findServerInterface(&serverEntry) && !serverEntry.broadcast().isNull())
+            udpDhcpSocket->writeDatagram(resp, serverEntry.broadcast(), DHCP_CLIENT_PORT);
         udpDhcpSocket->writeDatagram(resp, QHostAddress::Broadcast, DHCP_CLIENT_PORT);
 
         if (replyType == 5) {
@@ -829,7 +917,10 @@ void MainWindow::loadRobotDatabase() {
         if (it.key() == "dhcp_leases" && it.value().isObject()) {
             QJsonObject leases = it.value().toObject();
             for (auto lit = leases.begin(); lit != leases.end(); ++lit) {
-                macToIp[lit.key()] = lit.value().toString();
+                // Dzierżawy puste lub z innej podsieci (np. po zmianie adresacji) są pomijane.
+                const QString ip = lit.value().toString();
+                if (ip.startsWith(SUBNET_PREFIX))
+                    macToIp[lit.key()] = ip;
             }
         } else if (it.value().isString()) {
             uidToName[it.key()] = it.value().toString();

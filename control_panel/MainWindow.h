@@ -16,6 +16,7 @@
 #include <QMap>
 #include <QSet>
 #include <QDateTime>
+#include <QNetworkInterface>
 
 struct RobotInfo {
     QString uid;
@@ -79,6 +80,8 @@ private:
     QList<QString> getTargetUids(bool forceAll = false) const;
     QString allocateIpForMac(const QString &mac);
     bool isAllowedDeviceMac(const QString &mac) const;
+    bool findServerInterface(QNetworkAddressEntry *entry = nullptr) const;
+    void checkNetworkSetup();
 
     // Stałe portów i adresacji
     static constexpr quint16 UDP_COMMAND_PORT = 5005;
@@ -86,7 +89,10 @@ private:
     static constexpr quint16 HTTP_OTA_PORT    = 8000;
     static constexpr quint16 DHCP_SERVER_PORT = 67;
     static constexpr quint16 DHCP_CLIENT_PORT = 68;
-    const QString SERVER_ETH_IP = "192.168.1.1";
+    // Cała adresacja sieci robotów wynika z tego jednego prefiksu (/24).
+    // Zmieniając go, zmień też ROBOT_IP w skryptach scripts/*_START.bat.
+    const QString SUBNET_PREFIX = "192.168.1.";
+    const QString SERVER_ETH_IP = SUBNET_PREFIX + "1";
     const QString DB_FILENAME   = "znane_roboty.json";
 
     // Gniazda sieciowe i timery
@@ -100,6 +106,7 @@ private:
     QMap<QString, RobotInfo> fleet;
     QMap<QString, QString> uidToName;
     QMap<QString, QString> macToIp;
+    QSet<QString> rejectedMacsLogged;
     int nextDhcpOctet = 10;
     bool updatingTableProgrammatically = false;
     int otaDownloadsCount = 0;
