@@ -3,6 +3,7 @@ import socket
 import time
 import json
 import random
+import gc
 import os
 import sys
 import machine
@@ -74,11 +75,37 @@ def download_new_app(server_ip, server_port=8000):
         print("[OTA] Blad pobierania pliku:", e)
     return False
 
+def stop_motors():
+    # Po awarii app.py silniki zostaja z ostatnim wysterowaniem - zatrzymaj je.
+    try:
+        from Motor import PicoGo
+        PicoGo().stop()
+    except Exception:
+        pass
+
+def open_recovery_socket():
+    # app.py po awarii mogl zostawic otwarte gniazdo na porcie 5005. Bez zwolnienia go
+    # bind konczyl sie bledem i bootloader przestawal dzialac (zostawalo tylko USB).
+    while True:
+        sock = None
+        try:
+            gc.collect()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind(('0.0.0.0', 5005))
+            sock.settimeout(1.0)
+            return sock
+        except OSError as e:
+            print("[RECOVERY] Port 5005 niedostepny, ponawiam:", e)
+            try:
+                if sock:
+                    sock.close()
+            except Exception:
+                pass
+            time.sleep(1)
+
 def wait_for_recovery_ota():
     print("[RECOVERY] Czekam na poprawiony app.py (OTA_UPDATE) na porcie 5005...")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(('0.0.0.0', 5005))
-    sock.settimeout(1.0)
+    sock = open_recovery_socket()
     while True:
         led.toggle()
         try:
@@ -88,9 +115,7 @@ def wait_for_recovery_ota():
                 sock.close()
                 if download_new_app(addr[0], msg.get("port", 8000)):
                     return
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.bind(('0.0.0.0', 5005))
-                sock.settimeout(1.0)
+                sock = open_recovery_socket()
         except OSError:
             try:
                 uid = machine.unique_id().hex()
@@ -106,7 +131,6 @@ while True:
     try:
         if 'app' in sys.modules:
             del sys.modules['app']
-        import gc
         gc.collect()
         
         print("[MAIN] Uruchamiam app.py...")
@@ -118,4 +142,5 @@ while True:
             
     except Exception as e:
         print("[MAIN] BLAD KRYTYCZNY w pliku app.py:", e)
+        stop_motors()
         wait_for_recovery_ota()
