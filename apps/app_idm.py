@@ -45,7 +45,9 @@ params = {
     "acc": 0.5,
     "brake": 0.8,
     "dist": 0.0,         # Podgląd zmierzonej odległości w tabeli serwera
-    "spd": 0.0           # Podgląd aktualnej prędkości w tabeli serwera
+    "spd": 0.0,           # Podgląd aktualnej prędkości w tabeli serwera
+    "kp": KP,
+    "kd": KD
 }
 
 def dist():
@@ -112,6 +114,7 @@ def run():
     # Zmienne stanu modelu IDM oraz regulatora PD
     speed = 0.0
     last_err = 0
+    integral = 0.0
     last_time = time.ticks_us()
     last_dir = 0
     d = 100.0
@@ -173,9 +176,13 @@ def run():
                         last_heartbeat = 0
                         
                     if "params" in msg:
+                        if "ki" in msg["params"]:
+                            integral = 0.0
                         params.update(msg["params"])
                         if params["mode"] != "RUN":
                             speed = 0.0
+                            integral = 0.0
+                            last_err = 0
                             M.setMotor(0, 0)
                         last_time = time.ticks_us()
                         last_heartbeat = 0
@@ -187,6 +194,8 @@ def run():
         if params["mode"] != "RUN":
             M.setMotor(0, 0)
             speed = 0.0
+            integral = 0.0
+            last_err = 0
             last_time = now_us
         else:
             # Odczyt linii
@@ -198,6 +207,8 @@ def run():
                     M.setMotor(-30, 30)
                 else:
                     M.setMotor(30, -30)
+                integral = 0.0
+                last_err = 0
                 last_time = now_us
             else:
                 # Obliczenie uchybu linii
@@ -210,12 +221,17 @@ def run():
                 dt = time.ticks_diff(now_us, last_time) / 1000000.0
                 if dt <= 0 or dt > 0.5:
                     dt = 0.02
-                
+
+                kp = float(params.get("kp", KP))
+                ki = float(params.get("ki", 0.0))
+                kd = float(params.get("kd", KD))
+
+                integral = max(-20000.0, min(20000.0, integral + err * dt))
                 der = (err - last_err) / dt
                 last_err = err
                 last_time = now_us
                 
-                corr = (KP * err) + (KD * der)
+                corr = (kp * err) + (ki * integral) + (kd * der)
 
                 # Pomiar odległości i docelowa prędkość z modelu
                 d = dist()
