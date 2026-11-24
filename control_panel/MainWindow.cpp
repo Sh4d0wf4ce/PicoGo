@@ -37,8 +37,8 @@ MainWindow::MainWindow(QWidget *parent)
                         cv::aruco::DetectorParameters p;
                         p.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
                         p.cornerRefinementWinSize = 5;
-                        p.minMarkerPerimeterRate = 0.06;
-                        p.errorCorrectionRate = 0.35;
+                        p.minMarkerPerimeterRate = 0.025; // było 0.06 (domyślne OpenCV u profesora: 0.03)
+                        p.errorCorrectionRate = 0.6;      // domyślna tolerancja na rozmycie z daleka
                         return p;
                     }()) {
 
@@ -374,8 +374,8 @@ QWidget* MainWindow::createVisionTab() {
     auto *row1 = new QHBoxLayout();
     comboCamera = new QComboBox();
     comboResolution = new QComboBox();
-    comboResolution->addItem("1280 x 720 (HD)", QSize(1280, 720));
     comboResolution->addItem("1920 x 1080 (FullHD)", QSize(1920, 1080));
+    comboResolution->addItem("1280 x 720 (HD)", QSize(1280, 720));
 
     auto *btnRefreshCam = new QPushButton("🔄 Odśwież");
     btnToggleCamera = new QPushButton("▶ Start kamery");
@@ -687,22 +687,76 @@ void MainWindow::toggleCamera() {
     int camIdx = comboCamera->currentData().toInt();
     QSize res = comboResolution->currentData().toSize();
 
-    if (!cameraCap.open(camIdx, cv::CAP_DSHOW)) {
-        cameraCap.open(camIdx, cv::CAP_ANY);
+    auto configureCap = [&](cv::VideoCapture &cap) {
+        // Najpierw FOURCC MJPG, potem rozdzielczość – zapobiega zbiciu 1080p do 640x480 na USB 2.0
+        cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+        cap.set(cv::CAP_PROP_FRAME_WIDTH, res.width());
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, res.height());
+        cap.set(cv::CAP_PROP_FPS, 30);
+        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+    };
+
+    auto getFourcc = [](cv::VideoCapture &cap) -> QString {
+        int v = static_cast<int>(cap.get(cv::CAP_PROP_FOURCC));
+        if (!v) return "?";
+        QString s;
+        for (int i = 0; i < 4; ++i)
+            s.append(QChar((v >> (8 * i)) & 0xFF));
+        return s;
+    };
+
+    QString backendName = "DSHOW";
+    cameraCap.open(camIdx, cv::CAP_DSHOW);
+    if (cameraCap.isOpened()) {
+        configureCap(cameraCap);
     }
+
+    // Jeśli DSHOW nie przyjął MJPG lub zbił rozdzielczość, przełączamy na MSMF (jak w swarm_controller.py)
+    bool needMsmfFallback = !cameraCap.isOpened()
+                            || getFourcc(cameraCap) != "MJPG"
+                            || static_cast<int>(cameraCap.get(cv::CAP_PROP_FRAME_WIDTH)) < res.width();
+    if (needMsmfFallback) {
+        cameraCap.release();
+        cameraCap.open(camIdx, cv::CAP_MSMF);
+        if (cameraCap.isOpened()) {
+            configureCap(cameraCap);
+            if (getFourcc(cameraCap) == "MJPG" &&
+                static_cast<int>(cameraCap.get(cv::CAP_PROP_FRAME_WIDTH)) >= res.width()) {
+                backendName = "MSMF";
+            } else {
+                cameraCap.release();
+                cameraCap.open(camIdx, cv::CAP_DSHOW);
+                if (cameraCap.isOpened()) configureCap(cameraCap);
+                backendName = "DSHOW";
+            }
+        } else {
+            cameraCap.open(camIdx, cv::CAP_DSHOW);
+            if (cameraCap.isOpened()) configureCap(cameraCap);
+            backendName = "DSHOW";
+        }
+    }
+
     if (!cameraCap.isOpened()) {
         logMessage("[KAMERA BŁĄD] Nie można otworzyć wybranej kamery!");
         return;
     }
 
-    cameraCap.set(cv::CAP_PROP_FRAME_WIDTH, res.width());
-    cameraCap.set(cv::CAP_PROP_FRAME_HEIGHT, res.height());
-    cameraCap.set(cv::CAP_PROP_FPS, 30);
+    // Wyłączenie autofokusa i ekspozycja jak w kodzie profesora
+    cameraCap.set(cv::CAP_PROP_AUTOFOCUS, 0);
+    cameraCap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.75);
+
+    int realW = static_cast<int>(cameraCap.get(cv::CAP_PROP_FRAME_WIDTH));
+    int realH = static_cast<int>(cameraCap.get(cv::CAP_PROP_FRAME_HEIGHT));
+    double realFps = cameraCap.get(cv::CAP_PROP_FPS);
+    QString realFourcc = getFourcc(cameraCap);
 
     cameraTimer->start(33);
     btnToggleCamera->setText("⏹ Stop kamery");
     btnToggleCamera->setStyleSheet("background-color: #9e2a2b; color: white; font-weight: bold; padding: 4px 12px;");
-    logMessage(QString("[KAMERA] Uruchomiono kamerę %1 (%2x%3).").arg(camIdx).arg(res.width()).arg(res.height()));
+    logMessage(QString("[KAMERA] Kamera %1: żądano %2x%3 -> faktycznie %4x%5 @ %6 fps, format %7, backend %8.")
+                   .arg(camIdx).arg(res.width()).arg(res.height())
+                   .arg(realW).arg(realH).arg(realFps, 0, 'f', 1)
+                   .arg(realFourcc, backendName));
 }
 
 double MainWindow::normalizeAngleDeg(double a) {
