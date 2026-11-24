@@ -5,12 +5,13 @@
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHeaderView>
-#include <QPushButton>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFile>
 #include <QMenuBar>
 #include <QMenu>
+#include <QPainter>
+#include <QPen>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -18,11 +19,244 @@
 #include <QNetworkInterface>
 #include <QShortcut>
 #include <QRegularExpression>
+#include <QElapsedTimer>
 #include <QtEndian>
 #include <cmath>
 #include <algorithm>
+#include <set>
 
 static constexpr double kPi = 3.14159265358979323846;
+
+// ==================== WĄTEK KAMERY I DETEKCJI ARUCO ====================
+
+CameraThread::CameraThread(int camIdx, int reqW, int reqH, QObject *parent)
+    : QThread(parent), cameraIndex(camIdx), requestedWidth(reqW), requestedHeight(reqH) {}
+
+void CameraThread::stopCapture() {
+    running.store(false, std::memory_order_release);
+    if (isRunning()) {
+        wait(3000);
+    }
+}
+
+void CameraThread::run() {
+    auto configureCap = [&](cv::VideoCapture &cap) {
+        cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+        cap.set(cv::CAP_PROP_FRAME_WIDTH, requestedWidth);
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, requestedHeight);
+        cap.set(cv::CAP_PROP_FPS, 30);
+        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+    };
+
+    auto getFourcc = [](cv::VideoCapture &cap) -> QString {
+        int v = static_cast<int>(cap.get(cv::CAP_PROP_FOURCC));
+        if (!v) return "?";
+        QString s;
+        for (int i = 0; i < 4; ++i) s.append(QChar((v >> (8 * i)) & 0xFF));
+        return s;
+    };
+
+    cv::VideoCapture cap;
+    QString backendName = "DSHOW";
+    cap.open(cameraIndex, cv::CAP_DSHOW);
+    if (cap.isOpened()) {
+        configureCap(cap);
+    }
+
+    bool needMsmf = !cap.isOpened()
+                    || getFourcc(cap) != "MJPG"
+                    || static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH)) < requestedWidth;
+    if (needMsmf) {
+        cap.release();
+        cap.open(cameraIndex, cv::CAP_MSMF);
+        if (cap.isOpened()) {
+            configureCap(cap);
+            if (getFourcc(cap) == "MJPG" &&
+                static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH)) >= requestedWidth) {
+                backendName = "MSMF";
+            } else {
+                cap.release();
+                cap.open(cameraIndex, cv::CAP_DSHOW);
+                if (cap.isOpened()) configureCap(cap);
+                backendName = "DSHOW";
+            }
+        } else {
+            cap.open(cameraIndex, cv::CAP_DSHOW);
+            if (cap.isOpened()) configureCap(cap);
+            backendName = "DSHOW";
+        }
+    }
+
+    if (!cap.isOpened()) {
+        emit cameraError(QString("Nie można otworzyć kamery %1.").arg(cameraIndex));
+        return;
+    }
+
+    cap.set(cv::CAP_PROP_AUTOFOCUS, 0);
+    cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.75);
+
+    int realW = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+    int realH = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+    double realFps = cap.get(cv::CAP_PROP_FPS);
+    QString realFourcc = getFourcc(cap);
+
+    QString info = QString("Kamera %1: %2x%3 @ %4 fps, %5 (%6)")
+                       .arg(cameraIndex).arg(realW).arg(realH)
+                       .arg(realFps, 0, 'f', 1).arg(realFourcc, backendName);
+    emit cameraOpened(info, realW, realH);
+
+    // Parametry detektora z vehicle_tracker_2.py (zoptymalizowane pod większy zasięg i odblaski)
+    cv::aruco::DetectorParameters params;
+    params.minMarkerPerimeterRate = 0.02;
+    params.polygonalApproxAccuracyRate = 0.05;
+    params.adaptiveThreshWinSizeMin = 3;
+    params.adaptiveThreshWinSizeMax = 33;
+    params.adaptiveThreshWinSizeStep = 6;
+    params.perspectiveRemovePixelPerCell = 8;
+    params.errorCorrectionRate = 0.6;
+    params.minOtsuStdDev = 3.0;
+    params.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
+    params.cornerRefinementWinSize = 5;
+    params.cornerRefinementMaxIterations = 30;
+    params.cornerRefinementMinAccuracy = 0.1;
+
+    cv::aruco::ArucoDetector detector(
+        cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50), params);
+
+    // Potwierdzanie nowych ID (2 kolejne klatki) + trzymanie utraconych (8 klatek)
+    constexpr int CONFIRM_FRAMES = 2;
+    constexpr int MAX_MISSED_FRAMES = 8;
+    QMap<int, DetectedMarker> known;
+    QMap<int, int> pending;
+
+    running.store(true, std::memory_order_release);
+    guiBusy.store(false, std::memory_order_release);
+
+    QElapsedTimer fpsTimer;
+    fpsTimer.start();
+    int fpsFrames = 0;
+    double currentFps = 0.0;
+
+    cv::Mat frame, gray, rgb;
+
+    while (running.load(std::memory_order_acquire)) {
+        QElapsedTimer readTimer;
+        readTimer.start();
+        if (!cap.read(frame) || frame.empty()) {
+            msleep(10);
+            continue;
+        }
+
+        // Opróżnianie przestarzałych klatek z bufora sterownika (jak w swarm_controller_2.py)
+        if (readTimer.elapsed() <= 8) {
+            int drained = 0;
+            for (int k = 0; k < 5; ++k) {
+                QElapsedTimer grabT;
+                grabT.start();
+                if (!cap.grab() || grabT.elapsed() > 8) break;
+                drained++;
+            }
+            if (drained > 0) {
+                cv::Mat fresh;
+                if (cap.retrieve(fresh) && !fresh.empty()) {
+                    frame = fresh;
+                }
+            }
+        }
+
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+
+        std::vector<int> ids;
+        std::vector<std::vector<cv::Point2f>> corners;
+        std::vector<std::vector<cv::Point2f>> rejected;
+        detector.detectMarkers(gray, corners, ids, rejected);
+
+        std::set<int> rawIds;
+        std::set<int> seenKnown;
+
+        for (size_t i = 0; i < ids.size(); ++i) {
+            int mId = ids[i];
+            if (mId < 0 || mId >= 50) continue;
+            rawIds.insert(mId);
+
+            const auto &pts = corners[i];
+            cv::Point2f center = 0.25f * (pts[0] + pts[1] + pts[2] + pts[3]);
+            cv::Point2f topMid = 0.5f * (pts[0] + pts[1]);
+            cv::Point2f vec = topMid - center;
+            double rawAngle = std::atan2(vec.y, vec.x) * 180.0 / kPi;
+
+            DetectedMarker cand;
+            cand.markerId = mId;
+            cand.centerX = center.x;
+            cand.centerY = center.y;
+            cand.rawAngleDeg = rawAngle;
+            cand.missedFrames = 0;
+
+            if (known.contains(mId)) {
+                known[mId] = cand;
+                seenKnown.insert(mId);
+                pending.remove(mId);
+            } else {
+                int cnt = pending.value(mId, 0) + 1;
+                if (cnt >= CONFIRM_FRAMES) {
+                    known[mId] = cand;
+                    seenKnown.insert(mId);
+                    pending.remove(mId);
+                } else {
+                    pending[mId] = cnt;
+                }
+            }
+        }
+
+        for (auto it = pending.begin(); it != pending.end(); ) {
+            if (rawIds.find(it.key()) == rawIds.end()) it = pending.erase(it);
+            else ++it;
+        }
+        for (auto it = known.begin(); it != known.end(); ) {
+            if (seenKnown.find(it.key()) == seenKnown.end()) {
+                it.value().missedFrames++;
+                if (it.value().missedFrames > MAX_MISSED_FRAMES) {
+                    it = known.erase(it);
+                    continue;
+                }
+            }
+            ++it;
+        }
+
+        fpsFrames++;
+        qint64 elapsedMs = fpsTimer.elapsed();
+        if (elapsedMs >= 1000) {
+            currentFps = fpsFrames * 1000.0 / elapsedMs;
+            fpsFrames = 0;
+            fpsTimer.restart();
+        }
+
+        // Bramka backpressure: jeśli GUI nadal rysuje poprzednią klatkę, nie zapychamy kolejki Qt
+        if (!guiBusy.exchange(true, std::memory_order_acq_rel)) {
+            if (debugRejected.load(std::memory_order_relaxed)) {
+                for (const auto &rej : rejected) {
+                    if (rej.size() != 4) continue;
+                    std::vector<cv::Point> poly;
+                    for (const auto &p : rej) poly.emplace_back(std::lround(p.x), std::lround(p.y));
+                    cv::polylines(frame, poly, true, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+                }
+            }
+
+            cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
+            QImage qimg(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888);
+            QVector<DetectedMarker> outMarkers;
+            outMarkers.reserve(known.size());
+            for (auto it = known.constBegin(); it != known.constEnd(); ++it) {
+                outMarkers.push_back(it.value());
+            }
+            emit frameProcessed(qimg.copy(), outMarkers, currentFps);
+        }
+    }
+
+    cap.release();
+}
+
+// ==================== GŁÓWNE OKNO APLIKACJI ====================
 
 static QString portHint(const QString &proto, quint16 port) {
     return QString("   Sprawdź, kto trzyma port: netstat -ano | findstr :%1\n"
@@ -30,20 +264,12 @@ static QString portHint(const QString &proto, quint16 port) {
                    "netsh interface ipv4 show excludedportrange protocol=%2").arg(port).arg(proto);
 }
 
-MainWindow::MainWindow(QWidget *parent)
-    : QMainWindow(parent),
-      arucoDetector(cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50),
-                    []() {
-                        cv::aruco::DetectorParameters p;
-                        p.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
-                        p.cornerRefinementWinSize = 5;
-                        p.minMarkerPerimeterRate = 0.025; // było 0.06 (domyślne OpenCV u profesora: 0.03)
-                        p.errorCorrectionRate = 0.6;      // domyślna tolerancja na rozmycie z daleka
-                        return p;
-                    }()) {
+MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
+    qRegisterMetaType<DetectedMarker>("DetectedMarker");
+    qRegisterMetaType<QVector<DetectedMarker>>("QVector<DetectedMarker>");
 
     setWindowTitle("PicoGo Control Panel - IDM & ArUco Flocking");
-    resize(1340, 760);
+    resize(1360, 780);
 
     commandSeq = static_cast<quint32>(QDateTime::currentSecsSinceEpoch() & 0x3fffffff);
 
@@ -51,6 +277,7 @@ MainWindow::MainWindow(QWidget *parent)
     loadArenaConfig();
     setupMenuBar();
     setupUi();
+    updateNetworkCache();
 
     // 1. Gniazdo nasłuchujące meldunków HELLO (Port UDP 5006)
     udpListenSocket = new QUdpSocket(this);
@@ -58,7 +285,7 @@ MainWindow::MainWindow(QWidget *parent)
         connect(udpListenSocket, &QUdpSocket::readyRead, this, &MainWindow::onUdpReadyRead);
         logMessage(QString("Nasłuch telemetrii UDP uruchomiony na porcie %1.").arg(UDP_LISTEN_PORT));
     } else {
-        logMessage(QString("BŁĄD: Nie można otworzyć portu UDP %1 (%2) – telemetria robotów nie będzie widoczna.")
+        logMessage(QString("BŁĄD: Nie można otworzyć portu UDP %1 (%2).")
                        .arg(UDP_LISTEN_PORT).arg(udpListenSocket->errorString()));
         logMessage(portHint("udp", UDP_LISTEN_PORT));
     }
@@ -72,7 +299,7 @@ MainWindow::MainWindow(QWidget *parent)
         connect(httpOtaServer, &QTcpServer::newConnection, this, &MainWindow::onNewHttpConnection);
         logMessage(QString("Serwer HTTP OTA uruchomiony na porcie TCP %1.").arg(HTTP_OTA_PORT));
     } else {
-        logMessage(QString("BŁĄD: Nie można otworzyć portu TCP %1 (%2) – aktualizacje OTA nie będą działać.")
+        logMessage(QString("BŁĄD: Nie można otworzyć portu TCP %1 (%2).")
                        .arg(HTTP_OTA_PORT).arg(httpOtaServer->errorString()));
         logMessage(portHint("tcp", HTTP_OTA_PORT));
     }
@@ -82,16 +309,12 @@ MainWindow::MainWindow(QWidget *parent)
     connect(udpDhcpSocket, &QUdpSocket::readyRead, this, &MainWindow::onDhcpReadyRead);
     toggleDhcpServer(actDhcpEnable->isChecked());
 
-    // 5. Timer odświeżający statusy ONLINE / OFFLINE co 500 ms
+    // 5. Zbiorczy timer odświeżający tabele co 500 ms (i cache sieci co 3 s)
     statusTimer = new QTimer(this);
     connect(statusTimer, &QTimer::timeout, this, &MainWindow::refreshTableStatus);
     statusTimer->start(500);
 
-    // 6. Timer klatek kamery (30 FPS -> ~33 ms)
-    cameraTimer = new QTimer(this);
-    connect(cameraTimer, &QTimer::timeout, this, &MainWindow::processCameraFrame);
-
-    // Skrót klawiszowy: Spacja = Natychmiastowy STOP wszystkich robotów
+    // Spacja = Natychmiastowy STOP wszystkich robotów
     auto *spaceStop = new QShortcut(QKeySequence(Qt::Key_Space), this);
     connect(spaceStop, &QShortcut::activated, this, [this]() {
         stopVisionAll();
@@ -104,8 +327,11 @@ MainWindow::MainWindow(QWidget *parent)
 
 MainWindow::~MainWindow() {
     stopVisionAll();
-    if (cameraCap.isOpened())
-        cameraCap.release();
+    if (cameraThread) {
+        cameraThread->stopCapture();
+        delete cameraThread;
+        cameraThread = nullptr;
+    }
 }
 
 void MainWindow::setupMenuBar() {
@@ -186,7 +412,6 @@ QWidget* MainWindow::createIdmTab() {
     auto *rightLayout = new QVBoxLayout();
     rightLayout->setSpacing(6);
 
-    // 1. Szybkie akcje (bez osobnego "Identyfikuj zaznaczone", bączek -> Identyfikuj)
     auto *actionGroup = new QGroupBox("Sterowanie ruchem i kalibracja (Zaznaczone roboty)");
     auto *actionGrid = new QGridLayout(actionGroup);
     actionGrid->setContentsMargins(8, 6, 8, 6);
@@ -216,7 +441,6 @@ QWidget* MainWindow::createIdmTab() {
     actionGrid->addWidget(btnSpin, 1, 1);
     rightLayout->addWidget(actionGroup);
 
-    // 2. Parametry modelu IDM
     auto *paramGroup = new QGroupBox("Parametry modelu IDM (Zmiana na żywo)");
     auto *paramGrid = new QGridLayout(paramGroup);
     paramGrid->setContentsMargins(8, 6, 8, 6);
@@ -258,7 +482,6 @@ QWidget* MainWindow::createIdmTab() {
     paramGrid->addWidget(btnSendParams, 3, 0, 1, 2);
     rightLayout->addWidget(paramGroup);
 
-    // 3. NOWOŚĆ: Parametry regulatora PID (Trzymanie linii)
     auto *pidGroup = new QGroupBox("Regulator PID – trzymanie linii (Tłumienie oscylacji)");
     auto *pidGrid = new QGridLayout(pidGroup);
     pidGrid->setContentsMargins(8, 6, 8, 6);
@@ -301,7 +524,6 @@ QWidget* MainWindow::createIdmTab() {
     pidGrid->addWidget(btnSendPid, 3, 0, 1, 2);
     rightLayout->addWidget(pidGroup);
 
-    // 4. Generator korka widmowego
     auto *jamGroup = new QGroupBox("Generator korka widmowego (Impuls hamowania)");
     auto *jamGrid = new QGridLayout(jamGroup);
     jamGrid->setContentsMargins(8, 6, 8, 6);
@@ -326,7 +548,6 @@ QWidget* MainWindow::createIdmTab() {
     jamGrid->addWidget(btnJam, 2, 0, 1, 2);
     rightLayout->addWidget(jamGroup);
 
-    // 5. Menedżer OTA
     auto *otaGroup = new QGroupBox("Bezprzewodowa aktualizacja kodu (OTA Update)");
     auto *otaLayout = new QVBoxLayout(otaGroup);
     otaLayout->setContentsMargins(8, 6, 8, 6);
@@ -342,7 +563,7 @@ QWidget* MainWindow::createIdmTab() {
     auto *verRow = new QHBoxLayout();
     chkAutoVersionTag = new QCheckBox("Nadpisz APP_VERSION:");
     chkAutoVersionTag->setChecked(true);
-    editCustomVersionTag = new QLineEdit("vision_1.0");
+    editCustomVersionTag = new QLineEdit("vision_1.1");
     verRow->addWidget(chkAutoVersionTag);
     verRow->addWidget(editCustomVersionTag);
     otaLayout->addLayout(verRow);
@@ -370,16 +591,25 @@ QWidget* MainWindow::createVisionTab() {
     vbox->setContentsMargins(6, 6, 6, 6);
     vbox->setSpacing(6);
 
-    // Wiersz 1: Kamera, korekta kąta i STOP
+    // Wiersz 1: Kamera, debug ArUco, korekta kąta i STOP
     auto *row1 = new QHBoxLayout();
     comboCamera = new QComboBox();
     comboResolution = new QComboBox();
     comboResolution->addItem("1920 x 1080 (FullHD)", QSize(1920, 1080));
     comboResolution->addItem("1280 x 720 (HD)", QSize(1280, 720));
 
-    auto *btnRefreshCam = new QPushButton("🔄 Odśwież");
+    btnRefreshCam = new QPushButton("🔄 Odśwież");
     btnToggleCamera = new QPushButton("▶ Start kamery");
     btnToggleCamera->setStyleSheet("background-color: #1e6f3d; color: white; font-weight: bold; padding: 4px 12px;");
+
+    chkDebugAruco = new QCheckBox("Debug (odrzucone)");
+    chkDebugAruco->setToolTip("Rysuje na czerwono kwadraty wykryte przez OpenCV, których nie udało się zdekodować.");
+    connect(chkDebugAruco, &QCheckBox::toggled, this, [this](bool on) {
+        if (cameraThread) cameraThread->setDebugRejected(on);
+    });
+
+    lblCameraFps = new QLabel("FPS: --");
+    lblCameraFps->setStyleSheet("font-weight: bold; color: #4ec9b0;");
 
     spinHeadingOffset = new QSpinBox();
     spinHeadingOffset->setRange(-180, 180);
@@ -402,15 +632,18 @@ QWidget* MainWindow::createVisionTab() {
     row1->addWidget(comboResolution);
     row1->addWidget(btnRefreshCam);
     row1->addWidget(btnToggleCamera);
-    row1->addSpacing(12);
-    row1->addWidget(new QLabel("Korekta ArUco:"));
+    row1->addWidget(chkDebugAruco);
+    row1->addSpacing(8);
+    row1->addWidget(lblCameraFps);
+    row1->addSpacing(10);
+    row1->addWidget(new QLabel("Korekta:"));
     row1->addWidget(spinHeadingOffset);
     row1->addWidget(comboTurnSign);
     row1->addStretch();
     row1->addWidget(btnStopVis);
     vbox->addLayout(row1);
 
-    // Wiersz 2: Sterowanie torem (Ósemka, Interaktywne koło, Kalibracja areny)
+    // Wiersz 2: Sterowanie torem
     auto *row2 = new QHBoxLayout();
     auto *btnFig8 = new QPushButton("∞ Ósemka (Wybrany)");
     auto *btnCircleSetup = new QPushButton("🎯 Dopasuj okrąg (Przeciągnij/Scroll)");
@@ -452,13 +685,12 @@ QWidget* MainWindow::createVisionTab() {
     vbox->addLayout(row2);
 
     lblVisionStatus = new QLabel(
-        "Mapowanie: PICO_X = ArUco #X. Wybierz robota w tabeli i kliknij na obraz (cel), "
-        "użyj 'Dopasuj okrąg' do ustawienia na torze, albo uruchom symulację Ławicy ryb."
+        "Mapowanie: PICO_X = ArUco #X. Wybierz rozdzielczość przed kliknięciem 'Start kamery'. "
+        "Zaznacz robota w tabeli i kliknij na obraz (cel), dopasuj okrąg lub uruchom Ławicę ryb (model A)."
     );
     lblVisionStatus->setStyleSheet("color: #dcdcaa; font-weight: bold;");
     vbox->addWidget(lblVisionStatus);
 
-    // Część główna: Podgląd kamery po lewej + Tabela i panel Ławicy ryb po prawej
     auto *contentRow = new QHBoxLayout();
 
     videoLabel = new ClickableVideoLabel("Kamera wyłączona – kliknij 'Start kamery'");
@@ -471,7 +703,6 @@ QWidget* MainWindow::createVisionTab() {
     connect(videoLabel, &ClickableVideoLabel::wheelScrolled, this, &MainWindow::onVideoWheelScrolled);
     contentRow->addWidget(videoLabel, 1);
 
-    // Prawa kolumna Zakładki 2
     auto *rightCol = new QVBoxLayout();
     rightCol->setSpacing(6);
 
@@ -485,8 +716,8 @@ QWidget* MainWindow::createVisionTab() {
     connect(visionTable, &QTableWidget::itemSelectionChanged, this, &MainWindow::onVisionTableSelectionChanged);
     rightCol->addWidget(visionTable, 1);
 
-    // Panel symulacji Ławicy ryb (flocking_simple.py w C++)
-    auto *flockGroup = new QGroupBox("🐟 Symulacja ławicy ryb (Boids – parametry na żywo)");
+    // Panel symulacji Ławicy ryb (Model A z flocking_2.py)
+    auto *flockGroup = new QGroupBox("🐟 Symulacja ławicy ryb – model A (parametry na żywo)");
     flockGroup->setFixedWidth(450);
     auto *fg = new QGridLayout(flockGroup);
     fg->setContentsMargins(8, 6, 8, 6);
@@ -508,19 +739,19 @@ QWidget* MainWindow::createVisionTab() {
     spinFlockSpeed->setSuffix(" cm/s");
 
     spinFlockTurnR = new QDoubleSpinBox();
-    spinFlockTurnR->setRange(8.0, 100.0);
+    spinFlockTurnR->setRange(12.0, 120.0);
     spinFlockTurnR->setSingleStep(2.0);
     spinFlockTurnR->setValue(flockingSim.params.minTurnRadiusCm);
     spinFlockTurnR->setSuffix(" cm");
 
     spinFlockSep = new QDoubleSpinBox();
-    spinFlockSep->setRange(0.0, 30.0);
+    spinFlockSep->setRange(0.0, 40.0);
     spinFlockSep->setSingleStep(0.5);
     spinFlockSep->setValue(flockingSim.params.wSep);
 
     spinFlockAlign = new QDoubleSpinBox();
-    spinFlockAlign->setRange(0.0, 30.0);
-    spinFlockAlign->setSingleStep(0.5);
+    spinFlockAlign->setRange(0.0, 100.0);
+    spinFlockAlign->setSingleStep(2.0);
     spinFlockAlign->setValue(flockingSim.params.wAlign);
 
     spinFlockCoh = new QDoubleSpinBox();
@@ -529,7 +760,7 @@ QWidget* MainWindow::createVisionTab() {
     spinFlockCoh->setValue(flockingSim.params.wCoh);
 
     spinPreviewCount = new QSpinBox();
-    spinPreviewCount->setRange(1, 25);
+    spinPreviewCount->setRange(1, 30);
     spinPreviewCount->setValue(8);
 
     auto *btnFlockPreview = new QPushButton("👁 Podgląd ławicy (Bez robotów)");
@@ -599,22 +830,17 @@ QString MainWindow::findRobotUidByMarkerId(int markerId) const {
 }
 
 void MainWindow::rebuildVisionTable() {
-    // Pokazujemy wyłącznie aktywne roboty z floty (bez fałszywych duchów z szumu kamery)
     QMap<int, QString> markerToUid;
     for (auto it = fleet.begin(); it != fleet.end(); ++it) {
         int mId = extractNumberFromName(it.value().name);
-        if (mId >= 0) {
-            markerToUid[mId] = it.key();
-        }
+        if (mId >= 0) markerToUid[mId] = it.key();
     }
 
     QList<int> ids = markerToUid.keys();
     std::sort(ids.begin(), ids.end());
     qint64 now = QDateTime::currentMSecsSinceEpoch();
 
-    // Przebudowujemy wiersze tylko gdy zmieniła się lista robotów (nie zrywa zaznaczenia przy 30 FPS)
-    bool structureChanged = (ids != lastVisionTableIds);
-    if (structureChanged) {
+    if (ids != lastVisionTableIds) {
         lastVisionTableIds = ids;
         visionTable->blockSignals(true);
         visionTable->setRowCount(ids.size());
@@ -643,22 +869,23 @@ void MainWindow::rebuildVisionTable() {
                              .arg(vt.centerX, 0, 'f', 0)
                              .arg(vt.centerY, 0, 'f', 0)
                              .arg(vt.angleDeg, 0, 'f', 0);
-                camStatus = "👁 OK";
+                camStatus = (vt.missedFrames == 0) ? "👁 OK" : QString("🟠 (%1)").arg(vt.missedFrames);
             }
         }
 
         QStringList cols = {QString::number(mId), ri.name, ri.ip, netStatus, posStr, camStatus};
         for (int c = 0; c < cols.size(); ++c) {
             if (auto *it = visionTable->item(r, c)) {
-                it->setText(cols[c]);
+                if (it->text() != cols[c]) it->setText(cols[c]);
             }
         }
     }
 }
 
-// ==================== OBSŁUGA KAMERY ARUCO, KOŁA I ŁAWICY ====================
+// ==================== OBSŁUGA KAMERY W OSOBNYM WĄTKU ====================
 
 void MainWindow::refreshCameras() {
+    if (cameraThread != nullptr) return;
     comboCamera->clear();
     for (int i = 0; i < 5; ++i) {
         cv::VideoCapture testCap(i, cv::CAP_DSHOW);
@@ -673,245 +900,236 @@ void MainWindow::refreshCameras() {
 }
 
 void MainWindow::toggleCamera() {
-    if (cameraTimer->isActive()) {
+    if (cameraThread != nullptr) {
         stopVisionAll();
-        cameraTimer->stop();
-        cameraCap.release();
+        cameraThread->stopCapture();
+        delete cameraThread;
+        cameraThread = nullptr;
+
         btnToggleCamera->setText("▶ Start kamery");
         btnToggleCamera->setStyleSheet("background-color: #1e6f3d; color: white; font-weight: bold; padding: 4px 12px;");
+        comboCamera->setEnabled(true);
+        comboResolution->setEnabled(true);
+        btnRefreshCam->setEnabled(true);
+        lblCameraFps->setText("FPS: --");
         videoLabel->setPixmap(QPixmap());
         videoLabel->setText("Kamera zatrzymana");
+        visionTracks.clear();
+        rebuildVisionTable();
         return;
     }
 
     int camIdx = comboCamera->currentData().toInt();
     QSize res = comboResolution->currentData().toSize();
 
-    auto configureCap = [&](cv::VideoCapture &cap) {
-        // Najpierw FOURCC MJPG, potem rozdzielczość – zapobiega zbiciu 1080p do 640x480 na USB 2.0
-        cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-        cap.set(cv::CAP_PROP_FRAME_WIDTH, res.width());
-        cap.set(cv::CAP_PROP_FRAME_HEIGHT, res.height());
-        cap.set(cv::CAP_PROP_FPS, 30);
-        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-    };
+    // Blokujemy kontrolki kamery na czas działania strumienia (naprawia freeze przy 'Odśwież')
+    comboCamera->setEnabled(false);
+    comboResolution->setEnabled(false);
+    btnRefreshCam->setEnabled(false);
+    btnToggleCamera->setText("⏳ Otwieram...");
+    videoLabel->setText("Uruchamianie kamery w tle...");
 
-    auto getFourcc = [](cv::VideoCapture &cap) -> QString {
-        int v = static_cast<int>(cap.get(cv::CAP_PROP_FOURCC));
-        if (!v) return "?";
-        QString s;
-        for (int i = 0; i < 4; ++i)
-            s.append(QChar((v >> (8 * i)) & 0xFF));
-        return s;
-    };
+    cameraThread = new CameraThread(camIdx, res.width(), res.height(), this);
+    cameraThread->setDebugRejected(chkDebugAruco->isChecked());
+    connect(cameraThread, &CameraThread::cameraOpened, this, &MainWindow::onCameraOpened);
+    connect(cameraThread, &CameraThread::cameraError, this, &MainWindow::onCameraError);
+    connect(cameraThread, &CameraThread::frameProcessed, this, &MainWindow::onCameraFrameReady);
+    cameraThread->start();
+}
 
-    QString backendName = "DSHOW";
-    cameraCap.open(camIdx, cv::CAP_DSHOW);
-    if (cameraCap.isOpened()) {
-        configureCap(cameraCap);
-    }
-
-    // Jeśli DSHOW nie przyjął MJPG lub zbił rozdzielczość, przełączamy na MSMF (jak w swarm_controller.py)
-    bool needMsmfFallback = !cameraCap.isOpened()
-                            || getFourcc(cameraCap) != "MJPG"
-                            || static_cast<int>(cameraCap.get(cv::CAP_PROP_FRAME_WIDTH)) < res.width();
-    if (needMsmfFallback) {
-        cameraCap.release();
-        cameraCap.open(camIdx, cv::CAP_MSMF);
-        if (cameraCap.isOpened()) {
-            configureCap(cameraCap);
-            if (getFourcc(cameraCap) == "MJPG" &&
-                static_cast<int>(cameraCap.get(cv::CAP_PROP_FRAME_WIDTH)) >= res.width()) {
-                backendName = "MSMF";
-            } else {
-                cameraCap.release();
-                cameraCap.open(camIdx, cv::CAP_DSHOW);
-                if (cameraCap.isOpened()) configureCap(cameraCap);
-                backendName = "DSHOW";
-            }
-        } else {
-            cameraCap.open(camIdx, cv::CAP_DSHOW);
-            if (cameraCap.isOpened()) configureCap(cameraCap);
-            backendName = "DSHOW";
-        }
-    }
-
-    if (!cameraCap.isOpened()) {
-        logMessage("[KAMERA BŁĄD] Nie można otworzyć wybranej kamery!");
-        return;
-    }
-
-    // Wyłączenie autofokusa i ekspozycja jak w kodzie profesora
-    cameraCap.set(cv::CAP_PROP_AUTOFOCUS, 0);
-    cameraCap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.75);
-
-    int realW = static_cast<int>(cameraCap.get(cv::CAP_PROP_FRAME_WIDTH));
-    int realH = static_cast<int>(cameraCap.get(cv::CAP_PROP_FRAME_HEIGHT));
-    double realFps = cameraCap.get(cv::CAP_PROP_FPS);
-    QString realFourcc = getFourcc(cameraCap);
-
-    cameraTimer->start(33);
+void MainWindow::onCameraOpened(const QString &infoText, int realW, int realH) {
+    lastFrameW = realW;
+    lastFrameH = realH;
     btnToggleCamera->setText("⏹ Stop kamery");
     btnToggleCamera->setStyleSheet("background-color: #9e2a2b; color: white; font-weight: bold; padding: 4px 12px;");
-    logMessage(QString("[KAMERA] Kamera %1: żądano %2x%3 -> faktycznie %4x%5 @ %6 fps, format %7, backend %8.")
-                   .arg(camIdx).arg(res.width()).arg(res.height())
-                   .arg(realW).arg(realH).arg(realFps, 0, 'f', 1)
-                   .arg(realFourcc, backendName));
+    logMessage("[KAMERA] " + infoText);
+}
+
+void MainWindow::onCameraError(const QString &errMsg) {
+    logMessage("[KAMERA BŁĄD] " + errMsg);
+    lblVisionStatus->setText("Błąd kamery: " + errMsg);
+    if (cameraThread != nullptr) {
+        toggleCamera();
+    }
 }
 
 double MainWindow::normalizeAngleDeg(double a) {
     double r = std::fmod(a + 180.0, 360.0);
-    if (r < 0) r += 360.0;
+    if (r < 0.0) r += 360.0;
     return r - 180.0;
 }
 
-void MainWindow::processCameraFrame() {
-    cv::Mat frame;
-    if (!cameraCap.read(frame) || frame.empty()) return;
+void MainWindow::onCameraFrameReady(const QImage &rgbFrame, const QVector<DetectedMarker> &markers, double fps) {
+    if (!cameraThread) return;
 
-    lastFrameW = frame.cols;
-    lastFrameH = frame.rows;
+    // Gwarantuje zwolnienie bramki wątku kamery przy wyjściu z funkcji
+    struct ReadyGuard {
+        CameraThread *t;
+        ~ReadyGuard() { if (t) t->markGuiReady(); }
+    } guard{cameraThread};
+
+    if (rgbFrame.isNull()) return;
+    lastFrameW = rgbFrame.width();
+    lastFrameH = rgbFrame.height();
+
     if (!circleCenterInitialized) {
-        circleCenter = QPointF(frame.cols * 0.5, frame.rows * 0.5);
+        circleCenter = QPointF(lastFrameW * 0.5, lastFrameH * 0.5);
         circleCenterInitialized = true;
     }
-
-    cv::Mat gray;
-    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
-
-    // 1. Detekcja znaczników ArUco (DICT_4X4_50)
-    std::vector<int> ids;
-    std::vector<std::vector<cv::Point2f>> corners;
-    arucoDetector.detectMarkers(gray, corners, ids);
 
     qint64 now = QDateTime::currentMSecsSinceEpoch();
     double offsetDeg = spinHeadingOffset->value();
 
-    for (size_t i = 0; i < ids.size(); ++i) {
-        int mId = ids[i];
-        if (mId < 0 || mId >= 25) continue;
-
-        const auto &pts = corners[i];
-        cv::Point2f center = 0.25f * (pts[0] + pts[1] + pts[2] + pts[3]);
-        cv::Point2f topMid = 0.5f * (pts[0] + pts[1]);
-        cv::Point2f vec = topMid - center;
-        double rawAngle = std::atan2(vec.y, vec.x) * 180.0 / kPi;
-        double heading = normalizeAngleDeg(rawAngle + offsetDeg);
-
-        VisionTrack &tr = visionTracks[mId];
-        tr.markerId = mId;
-        tr.centerX = center.x;
-        tr.centerY = center.y;
-        tr.angleDeg = heading;
+    // 1. Aktualizacja torów na podstawie wykrytych/trzymanych znaczników z wątku kamery
+    for (const auto &m : markers) {
+        VisionTrack &tr = visionTracks[m.markerId];
+        tr.markerId = m.markerId;
+        tr.centerX = m.centerX;
+        tr.centerY = m.centerY;
+        tr.angleDeg = normalizeAngleDeg(m.rawAngleDeg + offsetDeg);
+        tr.missedFrames = m.missedFrames;
         tr.lastSeenMs = now;
-
-        QString uid = findRobotUidByMarkerId(mId);
-        bool hasOnlineRobot = (!uid.isEmpty() && fleet.contains(uid) && (now - fleet[uid].lastSeenMs) < 5000);
-        cv::Scalar color = hasOnlineRobot ? cv::Scalar(0, 230, 0) : cv::Scalar(0, 165, 255);
-
-        cv::Point cPt(std::lround(center.x), std::lround(center.y));
-        double rad = heading * kPi / 180.0;
-        cv::Point arrowEnd(std::lround(center.x + 42.0 * std::cos(rad)),
-                           std::lround(center.y + 42.0 * std::sin(rad)));
-
-        cv::circle(frame, cPt, 6, color, -1, cv::LINE_AA);
-        cv::arrowedLine(frame, cPt, arrowEnd, color, 3, cv::LINE_AA, 0, 0.28);
-
-        QString label = hasOnlineRobot
-                            ? QString("PICO_%1 [.%2]").arg(mId).arg(fleet[uid].ip.split('.').last())
-                            : QString("ArUco #%1").arg(mId);
-        cv::putText(frame, label.toStdString(), cv::Point(cPt.x + 10, cPt.y - 10),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv::LINE_AA);
     }
 
-    // 2. Krok sterowania wizyjnego / symulacji ławicy
-    stepVisionControl(frame.cols, frame.rows);
+    // 2. Krok sterowania wizyjnego / ławicy ryb (działa nawet gdy użytkownik przełączył się na Zakładkę 1!)
+    stepVisionControl(lastFrameW, lastFrameH);
 
-    // 3. Rysowanie nakładek na obrazie
-    // 3a) Ramka areny (podczas kalibracji i trybów ławicy)
-    if (arenaCalibrating) {
-        for (int i = 0; i < arenaClickPoints.size(); ++i) {
-            cv::Point pt(std::lround(arenaClickPoints[i].x()), std::lround(arenaClickPoints[i].y()));
-            cv::circle(frame, pt, 8, cv::Scalar(0, 220, 255), -1, cv::LINE_AA);
-            cv::putText(frame, std::to_string(i + 1), cv::Point(pt.x + 10, pt.y - 8),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 220, 255), 2, cv::LINE_AA);
-            if (i > 0) {
-                cv::Point prev(std::lround(arenaClickPoints[i - 1].x()), std::lround(arenaClickPoints[i - 1].y()));
-                cv::line(frame, prev, pt, cv::Scalar(0, 220, 255), 2, cv::LINE_AA);
+    // 3. Rysowanie podglądu wideo TYLKO gdy Zakładka 2 jest aktualnie widoczna (oszczędza CPU na Zakładce 1)
+    if (mainTabs->currentIndex() == 1) {
+        lblCameraFps->setText(QString("FPS: %1 (%2x%3)").arg(fps, 0, 'f', 1).arg(lastFrameW).arg(lastFrameH));
+
+        QImage drawn = rgbFrame;
+        QPainter p(&drawn);
+        p.setRenderHint(QPainter::Antialiasing, true);
+
+        // Znaczniki ArUco
+        for (const auto &m : markers) {
+            QString uid = findRobotUidByMarkerId(m.markerId);
+            bool online = (!uid.isEmpty() && fleet.contains(uid) && (now - fleet[uid].lastSeenMs) < 5000);
+            QColor col = m.isHeld() ? QColor(255, 165, 0) : (online ? QColor(0, 235, 0) : QColor(80, 190, 255));
+
+            double headingRad = normalizeAngleDeg(m.rawAngleDeg + offsetDeg) * kPi / 180.0;
+            QPointF cPt(m.centerX, m.centerY);
+            QPointF endPt(m.centerX + 42.0 * std::cos(headingRad), m.centerY + 42.0 * std::sin(headingRad));
+
+            p.setPen(QPen(col, 3));
+            p.setBrush(col);
+            p.drawEllipse(cPt, 5, 5);
+            p.drawLine(cPt, endPt);
+
+            // Grot strzałki
+            double headA1 = headingRad + 2.6;
+            double headA2 = headingRad - 2.6;
+            p.drawLine(endPt, QPointF(endPt.x() + 12.0 * std::cos(headA1), endPt.y() + 12.0 * std::sin(headA1)));
+            p.drawLine(endPt, QPointF(endPt.x() + 12.0 * std::cos(headA2), endPt.y() + 12.0 * std::sin(headA2)));
+
+            QString label = online
+                                ? QString("PICO_%1 [.%2]").arg(m.markerId).arg(fleet[uid].ip.split('.').last())
+                                : QString("ArUco #%1").arg(m.markerId);
+            if (m.isHeld()) label += " (hold)";
+            p.setFont(QFont("Consolas", 11, QFont::Bold));
+            p.drawText(QPointF(cPt.x() + 10, cPt.y() - 10), label);
+        }
+
+        // Kalibracja 4 rogów areny
+        if (arenaCalibrating) {
+            p.setPen(QPen(QColor(255, 220, 0), 3));
+            p.setBrush(QColor(255, 220, 0));
+            for (int i = 0; i < arenaClickPoints.size(); ++i) {
+                p.drawEllipse(arenaClickPoints[i], 7, 7);
+                p.drawText(arenaClickPoints[i] + QPointF(10, -8), QString::number(i + 1));
+                if (i > 0) p.drawLine(arenaClickPoints[i - 1], arenaClickPoints[i]);
+            }
+        } else if (visionMode == VisionMode::FlockingPreview || visionMode == VisionMode::FlockingRobots) {
+            // Ramka areny + strefy bezpieczeństwa z overlay_polygons()
+            auto cornersN = flockingSim.getCornersNorm();
+            QPolygonF arenaPoly;
+            for (const auto &c : cornersN) arenaPoly << QPointF(c.x * lastFrameW, c.y * lastFrameH);
+            p.setPen(QPen(QColor(0, 220, 255), 3));
+            p.setBrush(Qt::NoBrush);
+            p.drawPolygon(arenaPoly);
+
+            for (const auto &ov : flockingSim.getOverlayPolygons()) {
+                QPolygonF poly;
+                for (const auto &pt : ov.pointsNorm) poly << QPointF(pt.x * lastFrameW, pt.y * lastFrameH);
+                QColor col(int(ov.colorBgr[2]), int(ov.colorBgr[1]), int(ov.colorBgr[0]));
+                p.setPen(QPen(col, ov.thickness, Qt::DashLine));
+                p.drawPolygon(poly);
             }
         }
-    } else if (visionMode == VisionMode::FlockingPreview || visionMode == VisionMode::FlockingRobots) {
-        auto cornersN = flockingSim.getCornersNorm();
-        std::vector<cv::Point> poly;
-        for (const auto &c : cornersN) {
-            poly.emplace_back(std::lround(c.x * frame.cols), std::lround(c.y * frame.rows));
-        }
-        cv::polylines(frame, poly, true, cv::Scalar(255, 220, 0), 2, cv::LINE_AA);
-    }
 
-    // 3b) Tryby jazdy (Punkt / Ósemka / Koło / Ławica)
-    if (visionMode == VisionMode::Point && selectedMarkerId >= 0) {
-        cv::circle(frame, cv::Point(visionPointTarget.x(), visionPointTarget.y()), 10, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
-    } else if (visionMode == VisionMode::FigureEight && !figure8Path.isEmpty()) {
-        for (int i = 0; i < figure8Path.size(); ++i) {
-            QPointF p1 = figure8Path[i];
-            QPointF p2 = figure8Path[(i + 1) % figure8Path.size()];
-            cv::line(frame, cv::Point(p1.x(), p1.y()), cv::Point(p2.x(), p2.y()), cv::Scalar(255, 0, 255), 2, cv::LINE_AA);
-        }
-        cv::circle(frame, cv::Point(visionPointTarget.x(), visionPointTarget.y()), 9, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
-    } else if (visionMode == VisionMode::CircleSetup || visionMode == VisionMode::Circle) {
-        cv::Scalar cCol = (visionMode == VisionMode::CircleSetup) ? cv::Scalar(0, 255, 255) : cv::Scalar(0, 200, 255);
-        cv::Point cc(std::lround(circleCenter.x()), std::lround(circleCenter.y()));
-        cv::circle(frame, cc, std::lround(circleRadius), cCol, 2, cv::LINE_AA);
-        cv::drawMarker(frame, cc, cCol, cv::MARKER_CROSS, 20, 2);
+        // Nakładki aktywnych trybów
+        if (visionMode == VisionMode::Point && selectedMarkerId >= 0) {
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(255, 40, 40));
+            p.drawEllipse(visionPointTarget, 10, 10);
+        } else if (visionMode == VisionMode::FigureEight && !figure8Path.isEmpty()) {
+            p.setPen(QPen(QColor(255, 0, 255), 2));
+            p.setBrush(Qt::NoBrush);
+            p.drawPolygon(QPolygonF(figure8Path));
+            p.setBrush(QColor(255, 40, 40));
+            p.drawEllipse(visionPointTarget, 9, 9);
+        } else if (visionMode == VisionMode::CircleSetup || visionMode == VisionMode::Circle) {
+            QColor cCol = (visionMode == VisionMode::CircleSetup) ? QColor(255, 255, 0) : QColor(0, 220, 255);
+            p.setPen(QPen(cCol, 2));
+            p.setBrush(Qt::NoBrush);
+            p.drawEllipse(circleCenter, circleRadius, circleRadius);
+            p.drawLine(circleCenter + QPointF(-10, 0), circleCenter + QPointF(10, 0));
+            p.drawLine(circleCenter + QPointF(0, -10), circleCenter + QPointF(0, 10));
 
-        // Strzałka wskazująca kierunek obiegu koła (CW / CCW) na górze okręgu
-        int dir = comboCircleDir->currentData().toInt();
-        cv::Point topPt(cc.x, std::max(15, cc.y - static_cast<int>(circleRadius)));
-        cv::Point dirTip(topPt.x + dir * 40, topPt.y);
-        cv::arrowedLine(frame, topPt, dirTip, cCol, 3, cv::LINE_AA, 0, 0.35);
+            int dir = comboCircleDir->currentData().toInt();
+            QPointF topPt(circleCenter.x(), std::max(15.0, circleCenter.y() - circleRadius));
+            QPointF tipPt(topPt.x() + dir * 42.0, topPt.y());
+            p.setPen(QPen(cCol, 3));
+            p.drawLine(topPt, tipPt);
+            p.drawLine(tipPt, tipPt + QPointF(-dir * 10, -7));
+            p.drawLine(tipPt, tipPt + QPointF(-dir * 10,  7));
 
-        if (visionMode == VisionMode::CircleSetup) {
-            cv::putText(frame, "DOPASOWANIE: przeciagnij = przesun, scroll = promien",
-                        cv::Point(15, 32), cv::FONT_HERSHEY_SIMPLEX, 0.7, cCol, 2, cv::LINE_AA);
-        }
-    } else if (visionMode == VisionMode::FlockingPreview) {
-        for (const auto &b : flockingSim.getBoids()) {
-            cv::Point2d nPt = flockingSim.ownToNorm(b.x, b.y);
-            cv::Point2d nHead = flockingSim.ownToNorm(b.x + 12.0 * std::cos(b.theta),
-                                                      b.y + 12.0 * std::sin(b.theta));
-            cv::Point p0(std::lround(nPt.x * frame.cols), std::lround(nPt.y * frame.rows));
-            cv::Point p1(std::lround(nHead.x * frame.cols), std::lround(nHead.y * frame.rows));
-            cv::circle(frame, p0, 8, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
-            cv::arrowedLine(frame, p0, p1, cv::Scalar(0, 255, 0), 2, cv::LINE_AA, 0, 0.35);
-            cv::putText(frame, "B" + std::to_string(b.markerId), cv::Point(p0.x + 9, p0.y - 6),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
-        }
-        cv::putText(frame, "PODGLAD LAWICY (bez robotow)",
-                    cv::Point(15, 32), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-    } else if (visionMode == VisionMode::FlockingRobots) {
-        for (auto it = flockingRobotTargetsPx.begin(); it != flockingRobotTargetsPx.end(); ++it) {
-            cv::Point tPt(std::lround(it.value().x()), std::lround(it.value().y()));
-            cv::circle(frame, tPt, 8, cv::Scalar(255, 0, 255), -1, cv::LINE_AA);
-            cv::putText(frame, "T" + std::to_string(it.key()), cv::Point(tPt.x + 8, tPt.y + 4),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 255), 2, cv::LINE_AA);
-            if (visionTracks.contains(it.key())) {
-                cv::Point rPt(std::lround(visionTracks[it.key()].centerX),
-                              std::lround(visionTracks[it.key()].centerY));
-                cv::line(frame, rPt, tPt, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
+            if (visionMode == VisionMode::CircleSetup) {
+                p.setFont(QFont("Consolas", 13, QFont::Bold));
+                p.drawText(QPointF(16, 30), "DOPASOWANIE: przeciagnij = przesun, scroll = promien");
+            }
+        } else if (visionMode == VisionMode::FlockingPreview) {
+            p.setPen(QPen(QColor(0, 255, 0), 2));
+            p.setBrush(QColor(0, 255, 0));
+            p.setFont(QFont("Consolas", 10, QFont::Bold));
+            for (const auto &b : flockingSim.getBoids()) {
+                cv::Point2d nPt = flockingSim.ownToNorm(b.x, b.y);
+                cv::Point2d nHead = flockingSim.ownToNorm(b.x + 14.0 * std::cos(b.theta),
+                                                          b.y + 14.0 * std::sin(b.theta));
+                QPointF p0(nPt.x * lastFrameW, nPt.y * lastFrameH);
+                QPointF p1(nHead.x * lastFrameW, nHead.y * lastFrameH);
+                p.drawEllipse(p0, 7, 7);
+                p.drawLine(p0, p1);
+                p.drawText(p0 + QPointF(9, -6), QString("B%1").arg(b.markerId));
+            }
+            p.setFont(QFont("Consolas", 13, QFont::Bold));
+            p.drawText(QPointF(16, 30), "PODGLAD LAWICY – MODEL A (bez robotow)");
+        } else if (visionMode == VisionMode::FlockingRobots) {
+            p.setPen(QPen(QColor(255, 0, 255), 2));
+            p.setBrush(QColor(255, 0, 255));
+            p.setFont(QFont("Consolas", 11, QFont::Bold));
+            for (auto it = flockingRobotTargetsPx.constBegin(); it != flockingRobotTargetsPx.constEnd(); ++it) {
+                p.drawEllipse(it.value(), 8, 8);
+                p.drawText(it.value() + QPointF(9, 4), QString("T%1").arg(it.key()));
+                if (visionTracks.contains(it.key())) {
+                    p.drawLine(QPointF(visionTracks[it.key()].centerX, visionTracks[it.key()].centerY), it.value());
+                }
             }
         }
+
+        p.end();
+
+        videoLabel->setSourceSize(drawn.width(), drawn.height());
+        videoLabel->setPixmap(QPixmap::fromImage(drawn).scaled(
+            videoLabel->size(), Qt::KeepAspectRatio, Qt::FastTransformation));
+
+        // Odświeżanie tabeli wizji maks. co 150 ms (~6-7 Hz) zamiast 30 razy/s
+        if (now - lastVisionTableUpdateMs >= 150) {
+            lastVisionTableUpdateMs = now;
+            rebuildVisionTable();
+        }
     }
-
-    // 4. Wyświetlenie klatki w QLabel
-    cv::Mat rgb;
-    cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
-    videoLabel->setSourceSize(rgb.cols, rgb.rows);
-    QImage qimg(rgb.data, rgb.cols, rgb.rows, int(rgb.step), QImage::Format_RGB888);
-    videoLabel->setPixmap(QPixmap::fromImage(qimg).scaled(
-        videoLabel->size(), Qt::KeepAspectRatio, Qt::FastTransformation));
-
-    rebuildVisionTable();
 }
 
 void MainWindow::sendVisionDriveCmd(int markerId, double speed, double turn) {
@@ -928,23 +1146,36 @@ void MainWindow::sendVisionDriveCmd(int markerId, double speed, double turn) {
     sendRawUdp(QJsonDocument(pkt).toJson(QJsonDocument::Compact), fleet[uid].ip);
 }
 
-bool MainWindow::driveMarkerToPoint(VisionTrack &tr, QPointF target, double speedCap) {
-    constexpr double ARRIVAL_RADIUS_PX = 18.0;
-    constexpr double SLOWDOWN_RADIUS_PX = 260.0;
+void MainWindow::resetTrackMemory(VisionTrack &tr) {
+    tr.smoothedSpeed = 0.0;
+    tr.smoothedTurn = 0.0;
+    tr.prevError = 0.0;
+    tr.filteredErrorRate = 0.0;
+    tr.lastControlMs = 0;
+    tr.hasPrevError = false;
+}
+
+bool MainWindow::driveMarkerToPoint(VisionTrack &tr, QPointF target, double speedCap, double pxScale) {
+    // Regulator PD ze skalowaniem względem rozdzielczości (z swarm_controller_2.py)
+    const double arrivalRadiusPx = 16.0 * pxScale;
+    const double slowdownRadiusPx = 220.0 * pxScale;
     constexpr double MIN_MOVING_SPEED = 0.08;
-    constexpr double DRIVE_MAX_TURN = 0.20;
+    constexpr double DRIVE_MAX_TURN = 0.25;
     constexpr double FULL_TURN_DEG = 100.0;
     constexpr double DEADBAND_DEG = 4.0;
-    constexpr double MAX_TURN_RATIO = 0.85;
+    constexpr double MAX_TURN_RATIO = 0.78;
+    constexpr double TURN_D_GAIN = 0.00055;
+    constexpr double ERR_RATE_TAU = 0.08;
+    constexpr double SPD_TAU = 0.18;
+    constexpr double TRN_TAU = 0.14;
 
     double dx = target.x() - tr.centerX;
     double dy = target.y() - tr.centerY;
     double dist = std::hypot(dx, dy);
 
-    if (dist <= ARRIVAL_RADIUS_PX) {
+    if (dist <= arrivalRadiusPx) {
         sendVisionDriveCmd(tr.markerId, 0.0, 0.0);
-        tr.smoothedSpeed = 0.0;
-        tr.smoothedTurn = 0.0;
+        resetTrackMemory(tr);
         return true;
     }
 
@@ -952,25 +1183,42 @@ bool MainWindow::driveMarkerToPoint(VisionTrack &tr, QPointF target, double spee
     double error = normalizeAngleDeg(desiredDeg - tr.angleDeg);
     double ae = std::abs(error);
 
-    double distScale = (dist >= SLOWDOWN_RADIUS_PX)
+    double distScale = (dist >= slowdownRadiusPx)
                            ? 1.0
-                           : (0.60 + 0.40 * ((dist - ARRIVAL_RADIUS_PX) / (SLOWDOWN_RADIUS_PX - ARRIVAL_RADIUS_PX)));
+                           : (0.40 + 0.60 * std::clamp((dist - arrivalRadiusPx) / std::max(1.0, slowdownRadiusPx - arrivalRadiusPx), 0.0, 1.0));
     double headShape = 0.5 * (1.0 + std::cos(ae * kPi / 180.0));
-    double headScale = 0.65 + 0.35 * headShape;
+    double headScale = 0.68 + 0.32 * headShape;
 
     double speed = std::max(MIN_MOVING_SPEED, speedCap * distScale * headScale);
-
     int turnSign = comboTurnSign->currentData().toInt();
+
     double turn = 0.0;
     if (ae > DEADBAND_DEG) {
         turn = std::clamp(DRIVE_MAX_TURN * error / FULL_TURN_DEG, -DRIVE_MAX_TURN, DRIVE_MAX_TURN) * turnSign;
     }
 
-    double lim = MAX_TURN_RATIO * speed;
+    qint64 now = QDateTime::currentMSecsSinceEpoch();
+    double dt = (tr.lastControlMs == 0) ? (1.0 / 30.0) : std::clamp((now - tr.lastControlMs) / 1000.0, 0.005, 0.2);
+    tr.lastControlMs = now;
+
+    // Człon różniczkujący D tłumiący oscylacje
+    if (tr.hasPrevError) {
+        double rate = normalizeAngleDeg(error - tr.prevError) / dt;
+        double aRate = 1.0 - std::exp(-dt / ERR_RATE_TAU);
+        tr.filteredErrorRate += aRate * (rate - tr.filteredErrorRate);
+        turn += turnSign * TURN_D_GAIN * tr.filteredErrorRate;
+    }
+    tr.prevError = error;
+    tr.hasPrevError = true;
+
+    double lim = std::min(DRIVE_MAX_TURN, MAX_TURN_RATIO * speed);
     turn = std::clamp(turn, -lim, lim);
 
-    tr.smoothedSpeed = 0.80 * tr.smoothedSpeed + 0.20 * speed;
-    tr.smoothedTurn  = 0.70 * tr.smoothedTurn  + 0.30 * turn;
+    double aV = 1.0 - std::exp(-dt / SPD_TAU);
+    double aU = 1.0 - std::exp(-dt / TRN_TAU);
+    tr.smoothedSpeed += aV * (speed - tr.smoothedSpeed);
+    tr.smoothedTurn  += aU * (turn  - tr.smoothedTurn);
+    tr.smoothedTurn = std::clamp(tr.smoothedTurn, -lim, lim);
 
     sendVisionDriveCmd(tr.markerId, tr.smoothedSpeed, tr.smoothedTurn);
     return false;
@@ -980,21 +1228,25 @@ void MainWindow::stepVisionControl(int frameW, int frameH) {
     if (visionMode == VisionMode::None || visionMode == VisionMode::CircleSetup) return;
     qint64 now = QDateTime::currentMSecsSinceEpoch();
 
+    // Skala pikseli względem referencji 6.75 px/cm (1080p bez zoomu w swarm_controller_2.py)
+    double ppc = flockingSim.getArenaPxPerCm(frameW, frameH);
+    double pxScale = (ppc > 0.1) ? std::clamp(ppc / 6.75, 0.3, 3.0) : (frameW / 1920.0);
+
     if (visionMode == VisionMode::Point) {
         if (!visionTracks.contains(selectedMarkerId)) return;
         VisionTrack &tr = visionTracks[selectedMarkerId];
-        if ((now - tr.lastSeenMs) > 400) {
+        if ((now - tr.lastSeenMs) > 450 || tr.missedFrames > 3) {
             sendVisionDriveCmd(selectedMarkerId, 0.0, 0.0);
             return;
         }
-        if (driveMarkerToPoint(tr, visionPointTarget, 0.36)) {
+        if (driveMarkerToPoint(tr, visionPointTarget, 0.36, pxScale)) {
             visionMode = VisionMode::None;
             lblVisionStatus->setText(QString("Robot PICO_%1 dotarł do wskazanego celu!").arg(selectedMarkerId));
         }
     } else if (visionMode == VisionMode::FigureEight) {
         if (!visionTracks.contains(selectedMarkerId)) return;
         VisionTrack &tr = visionTracks[selectedMarkerId];
-        if ((now - tr.lastSeenMs) > 400) {
+        if ((now - tr.lastSeenMs) > 450 || tr.missedFrames > 3) {
             sendVisionDriveCmd(selectedMarkerId, 0.0, 0.0);
             return;
         }
@@ -1009,48 +1261,63 @@ void MainWindow::stepVisionControl(int frameW, int frameH) {
         }
         for (int k = 0; k < figure8Path.size(); ++k) {
             QPointF pt = figure8Path[figure8Index];
-            if (std::hypot(pt.x() - tr.centerX, pt.y() - tr.centerY) > 105.0) break;
+            if (std::hypot(pt.x() - tr.centerX, pt.y() - tr.centerY) > 105.0 * pxScale) break;
             figure8Index = (figure8Index + 1) % figure8Path.size();
         }
         visionPointTarget = figure8Path[figure8Index];
-        driveMarkerToPoint(tr, visionPointTarget, 0.36);
+        driveMarkerToPoint(tr, visionPointTarget, 0.36, pxScale);
     } else if (visionMode == VisionMode::Circle) {
         int dir = comboCircleDir->currentData().toInt();
         for (auto it = visionTracks.begin(); it != visionTracks.end(); ++it) {
             VisionTrack &tr = it.value();
             QString uid = findRobotUidByMarkerId(tr.markerId);
             if (uid.isEmpty() || !fleet.contains(uid)) continue;
-            if ((now - tr.lastSeenMs) > 400) {
+            if ((now - tr.lastSeenMs) > 450 || tr.missedFrames > 3) {
                 sendVisionDriveCmd(tr.markerId, 0.0, 0.0);
                 continue;
             }
             double phi = std::atan2(tr.centerY - circleCenter.y(), tr.centerX - circleCenter.x());
-            double targetPhi = phi + dir * (135.0 / std::max(50.0, circleRadius));
+            double targetPhi = phi + dir * (135.0 * pxScale / std::max(50.0, circleRadius));
             QPointF lookahead(circleCenter.x() + circleRadius * std::cos(targetPhi),
                               circleCenter.y() + circleRadius * std::sin(targetPhi));
-            driveMarkerToPoint(tr, lookahead, 0.25);
+            driveMarkerToPoint(tr, lookahead, 0.25, pxScale);
         }
     } else if (visionMode == VisionMode::FlockingPreview) {
         double dt = (lastFlockingMs == 0) ? (1.0 / 30.0) : ((now - lastFlockingMs) / 1000.0);
         lastFlockingMs = now;
         flockingSim.step(dt);
     } else if (visionMode == VisionMode::FlockingRobots) {
+        // Bezpieczeństwo z swarm_controller_2.py: jeśli którykolwiek robot ławicy zniknął z kadru,
+        // zatrzymujemy wszystkie roboty i ZAMRAŻAMY czas symulacji (cele nie uciekają!).
+        const auto &boids = flockingSim.getBoids();
+        bool anyMissing = false;
+        for (const auto &b : boids) {
+            if (!visionTracks.contains(b.markerId) ||
+                (now - visionTracks[b.markerId].lastSeenMs) > 450 ||
+                visionTracks[b.markerId].missedFrames > 3) {
+                anyMissing = true;
+                break;
+            }
+        }
+        if (anyMissing) {
+            for (const auto &b : boids) {
+                sendVisionDriveCmd(b.markerId, 0.0, 0.0);
+                if (visionTracks.contains(b.markerId)) resetTrackMemory(visionTracks[b.markerId]);
+            }
+            lastFlockingMs = 0;
+            return;
+        }
+
         double dt = (lastFlockingMs == 0) ? (1.0 / 30.0) : ((now - lastFlockingMs) / 1000.0);
         lastFlockingMs = now;
 
         auto targetsNorm = flockingSim.step(dt);
         flockingRobotTargetsPx.clear();
 
-        // Bezpieczeństwo: jeśli któryś robot z ławicy zniknie z kamery, wstrzymujemy go
         for (const auto &[mId, nPt] : targetsNorm) {
             QPointF tPx(nPt.x * frameW, nPt.y * frameH);
             flockingRobotTargetsPx[mId] = tPx;
-
-            if (!visionTracks.contains(mId) || (now - visionTracks[mId].lastSeenMs) > 450) {
-                sendVisionDriveCmd(mId, 0.0, 0.0);
-                continue;
-            }
-            driveMarkerToPoint(visionTracks[mId], tPx, 0.40);
+            driveMarkerToPoint(visionTracks[mId], tPx, 0.42, pxScale);
         }
     }
 }
@@ -1080,7 +1347,12 @@ void MainWindow::onVideoImageClicked(double x, double y) {
                 cornersN[i] = cv::Point2f(static_cast<float>(arenaClickPoints[i].x() / lastFrameW),
                                           static_cast<float>(arenaClickPoints[i].y() / lastFrameH));
             }
-            flockingSim.configureArena(cornersN, spinArenaW->value(), spinArenaH->value());
+            std::string errMsg;
+            if (!flockingSim.configureArena(cornersN, spinArenaW->value(), spinArenaH->value(), &errMsg)) {
+                lblVisionStatus->setText("BŁĄD kalibracji: " + QString::fromStdString(errMsg) + " Spróbuj ponownie.");
+                arenaClickPoints.clear();
+                return;
+            }
             saveArenaConfig();
             arenaCalibrating = false;
             arenaClickPoints.clear();
@@ -1106,6 +1378,7 @@ void MainWindow::onVideoImageClicked(double x, double y) {
     }
     visionPointTarget = QPointF(x, y);
     visionMode = VisionMode::Point;
+    if (visionTracks.contains(selectedMarkerId)) resetTrackMemory(visionTracks[selectedMarkerId]);
     lblVisionStatus->setText(
         QString("Robot PICO_%1 jedzie do punktu (%2, %3)...").arg(selectedMarkerId).arg(int(x)).arg(int(y)));
 }
@@ -1145,8 +1418,7 @@ void MainWindow::startCircleSetup() {
     }
     visionMode = VisionMode::CircleSetup;
     lblVisionStatus->setText(
-        "DOPASOWANIE OKRĘGU: przeciągnij myszką po obrazie, aby przesunąć środek; "
-        "użyj scrolla myszy lub pola 'Promień', aby dopasować do toru, potem kliknij 'Start po okręgu'.");
+        "DOPASOWANIE OKRĘGU: przeciągnij myszką = przesuń środek, scroll = promień, potem kliknij 'Start po okręgu'.");
 }
 
 void MainWindow::startVisionCircleAll() {
@@ -1159,12 +1431,11 @@ void MainWindow::startVisionCircleAll() {
     visionMode = VisionMode::Circle;
     QString dirStr = (comboCircleDir->currentData().toInt() > 0) ? "zgodnie z zegarem" : "przeciwnie do zegara";
     lblVisionStatus->setText(
-        QString("Wszystkie widoczne roboty jadą po okręgu (%1, R=%2 px). Możesz nadal korygować pozycję/promień.")
-            .arg(dirStr).arg(int(circleRadius)));
+        QString("Wszystkie widoczne roboty jadą po okręgu (%1, R=%2 px).").arg(dirStr).arg(int(circleRadius)));
 }
 
 void MainWindow::startArenaCalibration() {
-    if (!cameraTimer->isActive()) {
+    if (!cameraThread) {
         lblVisionStatus->setText("Najpierw kliknij 'Start kamery', aby zobaczyć arenę!");
         return;
     }
@@ -1192,8 +1463,8 @@ void MainWindow::updateFlockingParamsFromUi() {
 }
 
 void MainWindow::startFlockingPreview() {
-    if (!cameraTimer->isActive()) {
-        lblVisionStatus->setText("Najpierw kliknij 'Start kamery', aby wyświetlić podgląd ławicy na obrazie!");
+    if (!cameraThread) {
+        lblVisionStatus->setText("Najpierw kliknij 'Start kamery', aby wyświetlić podgląd ławicy!");
         return;
     }
     stopVisionAll();
@@ -1203,12 +1474,11 @@ void MainWindow::startFlockingPreview() {
     lastFlockingMs = QDateTime::currentMSecsSinceEpoch();
     visionMode = VisionMode::FlockingPreview;
     lblVisionStatus->setText(
-        QString("Podgląd ławicy ryb dla %1 wirtualnych agentów (parametry po prawej działają na żywo!).")
-            .arg(spinPreviewCount->value()));
+        QString("Podgląd ławicy ryb (Model A) dla %1 wirtualnych agentów.").arg(spinPreviewCount->value()));
 }
 
 void MainWindow::startFlockingRobots() {
-    if (!cameraTimer->isActive()) {
+    if (!cameraThread) {
         lblVisionStatus->setText("Najpierw uruchom kamerę!");
         return;
     }
@@ -1220,7 +1490,7 @@ void MainWindow::startFlockingRobots() {
     std::vector<std::tuple<int, double, double, double>> visibleRobots;
     for (auto it = visionTracks.begin(); it != visionTracks.end(); ++it) {
         const VisionTrack &vt = it.value();
-        if ((now - vt.lastSeenMs) > 600) continue;
+        if ((now - vt.lastSeenMs) > 600 || vt.missedFrames > 3) continue;
         QString uid = findRobotUidByMarkerId(vt.markerId);
         if (uid.isEmpty() || !fleet.contains(uid) || (now - fleet[uid].lastSeenMs) >= 5000) continue;
 
@@ -1229,6 +1499,7 @@ void MainWindow::startFlockingRobots() {
             vt.centerX / std::max(1, lastFrameW),
             vt.centerY / std::max(1, lastFrameH),
             vt.angleDeg);
+        resetTrackMemory(it.value());
     }
 
     if (visibleRobots.empty()) {
@@ -1240,16 +1511,15 @@ void MainWindow::startFlockingRobots() {
     lastFlockingMs = now;
     visionMode = VisionMode::FlockingRobots;
     lblVisionStatus->setText(
-        QString("ŁAWICA RYB AKTYWNA dla %1 robotów! Zmieniaj wagi po prawej na żywo lub wciśnij Spację (STOP).")
-            .arg(visibleRobots.size()));
+        QString("ŁAWICA RYB (Model A) AKTYWNA dla %1 robotów! Wciśnij Spację, aby zatrzymać.").arg(visibleRobots.size()));
 }
 
 void MainWindow::stopVisionAll() {
     visionMode = VisionMode::None;
     flockingRobotTargetsPx.clear();
+    lastFlockingMs = 0;
     for (auto it = visionTracks.begin(); it != visionTracks.end(); ++it) {
-        it.value().smoothedSpeed = 0.0;
-        it.value().smoothedTurn = 0.0;
+        resetTrackMemory(it.value());
         sendVisionDriveCmd(it.key(), 0.0, 0.0);
     }
     if (lblVisionStatus) {
@@ -1257,12 +1527,13 @@ void MainWindow::stopVisionAll() {
     }
 }
 
-// ==================== WBUDOWANY SERWER DHCP (BEZ FILTRA MAC, Z IZOLACJĄ INTERFEJSU) ====================
+// ==================== WBUDOWANY SERWER DHCP (Z CACHE INTERFEJSÓW) ====================
 
 void MainWindow::toggleDhcpServer(bool enabled) {
     if (enabled) {
         if (udpDhcpSocket->bind(QHostAddress::AnyIPv4, DHCP_SERVER_PORT, QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
             logMessage("[DHCP] Serwer DHCP działa w tle na porcie UDP 67 (Pula: " + SUBNET_PREFIX + "21 - .250).");
+            updateNetworkCache();
             checkNetworkSetup();
         } else {
             logMessage("[DHCP BŁĄD] Port UDP 67 zajęty! Uruchom jako Administrator lub wyłącz inny serwer DHCP.");
@@ -1280,24 +1551,32 @@ static const QStringList kUbiquitiOui = {
 
 static bool macHasPrefix(const QString &mac, const QStringList &prefixes) {
     for (const QString &prefix : prefixes) {
-        if (mac.startsWith(prefix, Qt::CaseInsensitive))
-            return true;
+        if (mac.startsWith(prefix, Qt::CaseInsensitive)) return true;
     }
     return false;
 }
 
-bool MainWindow::findServerInterface(QNetworkAddressEntry *entry, int *ifaceIndex) const {
+void MainWindow::updateNetworkCache() {
+    cachedServerValid = false;
+    cachedServerIfaceIdx = -1;
+    cachedServerBroadcast = QHostAddress();
+    cachedAllBroadcasts.clear();
+
     for (const QNetworkInterface &iface : QNetworkInterface::allInterfaces()) {
         if (!(iface.flags() & QNetworkInterface::IsUp)) continue;
         for (const QNetworkAddressEntry &e : iface.addressEntries()) {
-            if (e.ip().protocol() == QAbstractSocket::IPv4Protocol && e.ip().toString() == SERVER_ETH_IP) {
-                if (entry) *entry = e;
-                if (ifaceIndex) *ifaceIndex = iface.index();
-                return true;
+            if (e.ip().protocol() != QAbstractSocket::IPv4Protocol) continue;
+            if (!e.broadcast().isNull()) {
+                QString bStr = e.broadcast().toString();
+                if (!cachedAllBroadcasts.contains(bStr)) cachedAllBroadcasts << bStr;
+            }
+            if (e.ip().toString() == SERVER_ETH_IP) {
+                cachedServerValid = true;
+                cachedServerIfaceIdx = iface.index();
+                cachedServerBroadcast = e.broadcast();
             }
         }
     }
-    return false;
 }
 
 void MainWindow::checkNetworkSetup() {
@@ -1308,10 +1587,8 @@ void MainWindow::checkNetworkSetup() {
         for (const QNetworkAddressEntry &e : iface.addressEntries()) {
             if (e.ip().protocol() != QAbstractSocket::IPv4Protocol) continue;
             const QString ip = e.ip().toString();
-            if (ip == SERVER_ETH_IP)
-                owners++;
-            else if (ip.startsWith(SUBNET_PREFIX))
-                sameSubnet << QString("%1 (%2)").arg(iface.humanReadableName(), ip);
+            if (ip == SERVER_ETH_IP) owners++;
+            else if (ip.startsWith(SUBNET_PREFIX)) sameSubnet << QString("%1 (%2)").arg(iface.humanReadableName(), ip);
         }
     }
 
@@ -1323,27 +1600,21 @@ void MainWindow::checkNetworkSetup() {
                        .arg(SERVER_ETH_IP).arg(owners));
     }
     if (!sameSubnet.isEmpty()) {
-        logMessage(QString("[SIEĆ UWAGA] Inna karta jest w tej samej podsieci co roboty: %1.")
-                       .arg(sameSubnet.join(", ")));
+        logMessage(QString("[SIEĆ UWAGA] Inna karta jest w tej samej podsieci co roboty: %1.").arg(sameSubnet.join(", ")));
     }
 }
 
 QString MainWindow::allocateIpForMac(const QString &mac) {
-    if (macToIp.contains(mac)) {
-        return macToIp[mac];
-    }
+    if (macToIp.contains(mac)) return macToIp[mac];
 
     const QString apIp = SUBNET_PREFIX + "10";
     if (macHasPrefix(mac, kUbiquitiOui) && !macToIp.values().contains(apIp)) {
         macToIp[mac] = apIp;
         saveRobotDatabase();
-        refreshTableStatus();
         return apIp;
     }
 
-    if (nextDhcpOctet < 21) {
-        nextDhcpOctet = 21;
-    }
+    if (nextDhcpOctet < 21) nextDhcpOctet = 21;
 
     QString assignedIp;
     while (nextDhcpOctet < 250) {
@@ -1361,7 +1632,6 @@ QString MainWindow::allocateIpForMac(const QString &mac) {
 
     macToIp[mac] = assignedIp;
     saveRobotDatabase();
-    refreshTableStatus();
     return assignedIp;
 }
 
@@ -1369,19 +1639,13 @@ void MainWindow::onDhcpReadyRead() {
     while (udpDhcpSocket->hasPendingDatagrams()) {
         QNetworkDatagram datagram = udpDhcpSocket->receiveDatagram();
 
-        // Izolacja: odpowiadamy tylko wtedy, gdy karta z SERVER_ETH_IP jest aktywna
-        // i pakiet przyszedł właśnie z tej karty (chroni sieć domową).
-        QNetworkAddressEntry serverEntry;
-        int serverIfaceIdx = -1;
-        if (!findServerInterface(&serverEntry, &serverIfaceIdx))
-            continue;
-        if (datagram.interfaceIndex() != 0 && static_cast<int>(datagram.interfaceIndex()) != serverIfaceIdx)
+        // Korzystamy wyłącznie ze szybkiego cache (bez odpytywania Windows API przy każdym pakiecie)
+        if (!cachedServerValid) continue;
+        if (datagram.interfaceIndex() != 0 && static_cast<int>(datagram.interfaceIndex()) != cachedServerIfaceIdx)
             continue;
 
         QByteArray req = datagram.data();
-        if (req.size() < 240 || static_cast<quint8>(req[0]) != 1)
-            continue;
-
+        if (req.size() < 240 || static_cast<quint8>(req[0]) != 1) continue;
         if (static_cast<quint8>(req[236]) != 0x63 || static_cast<quint8>(req[237]) != 0x82 ||
             static_cast<quint8>(req[238]) != 0x53 || static_cast<quint8>(req[239]) != 0x63)
             continue;
@@ -1451,11 +1715,10 @@ void MainWindow::onDhcpReadyRead() {
         resp.append(static_cast<char>(3));  resp.append(static_cast<char>(4)); resp.append(reinterpret_cast<const char*>(&serverIpInt), 4);
         resp.append(static_cast<char>(255));
 
-        if (resp.size() < 300)
-            resp.append(QByteArray(300 - resp.size(), 0));
+        if (resp.size() < 300) resp.append(QByteArray(300 - resp.size(), 0));
 
-        if (!serverEntry.broadcast().isNull())
-            udpDhcpSocket->writeDatagram(resp, serverEntry.broadcast(), DHCP_CLIENT_PORT);
+        if (!cachedServerBroadcast.isNull())
+            udpDhcpSocket->writeDatagram(resp, cachedServerBroadcast, DHCP_CLIENT_PORT);
         udpDhcpSocket->writeDatagram(resp, QHostAddress::Broadcast, DHCP_CLIENT_PORT);
 
         if (replyType == 5) {
@@ -1480,6 +1743,8 @@ void MainWindow::onUdpReadyRead() {
 
         QString uid = obj.value("id").toString();
         if (uid.isEmpty()) continue;
+
+        bool isNewInFleet = !fleet.contains(uid);
 
         if (!uidToName.contains(uid)) {
             QString newName = QString("PICO_%1").arg(uidToName.size() + 1);
@@ -1510,7 +1775,10 @@ void MainWindow::onUdpReadyRead() {
             r.spd = p.value("spd").toDouble(r.spd);
         }
 
-        updateTableRow(uid);
+        // Nowy robot tworzy wiersz natychmiast; aktualizacje komórek robi zbiorczy timer co 500 ms
+        if (isNewInFleet) {
+            ensureRobotRowExists(uid);
+        }
     }
 }
 
@@ -1570,9 +1838,7 @@ void MainWindow::sendRawUdp(const QByteArray &data, const QString &ip) {
 QList<QString> MainWindow::getTargetUids(bool forceAll) const {
     QList<QString> targets;
     for (auto it = fleet.begin(); it != fleet.end(); ++it) {
-        if (forceAll || it.value().selected) {
-            targets.append(it.key());
-        }
+        if (forceAll || it.value().selected) targets.append(it.key());
     }
     return targets;
 }
@@ -1584,11 +1850,8 @@ void MainWindow::sendJsonToTargets(const QJsonObject &payload, bool forceAll) {
 
     if (forceAll) {
         sendRawUdp(raw, "255.255.255.255");
-        for (const QNetworkInterface &iface : QNetworkInterface::allInterfaces()) {
-            for (const QNetworkAddressEntry &entry : iface.addressEntries()) {
-                if (!entry.broadcast().isNull())
-                    sendRawUdp(raw, entry.broadcast().toString());
-            }
+        for (const QString &bStr : cachedAllBroadcasts) {
+            sendRawUdp(raw, bStr);
         }
         for (const auto &r : fleet) {
             sendRawUdp(raw, r.ip);
@@ -1606,8 +1869,7 @@ void MainWindow::sendJsonToTargets(const QJsonObject &payload, bool forceAll) {
             sendRawUdp(raw, fleet[uid].ip);
             names << fleet[uid].name;
         }
-        logMessage(QString("--> Wysłano do [%1]: %2")
-                       .arg(names.join(", "), QString::fromUtf8(raw)));
+        logMessage(QString("--> Wysłano do [%1]: %2").arg(names.join(", "), QString::fromUtf8(raw)));
     }
 }
 
@@ -1702,53 +1964,39 @@ void MainWindow::sendOtaCommand() {
     sendJsonToTargets(QJsonObject{{"cmd", "OTA_UPDATE"}, {"port", HTTP_OTA_PORT}});
 }
 
-// ==================== ZARZĄDZANIE TABELĄ I BAZAMI JSON ====================
+// ==================== ZARZĄDZANIE TABELAMI I BAZAMI JSON ====================
 
-void MainWindow::updateTableRow(const QString &uid) {
-    updatingTableProgrammatically = true;
-    const RobotInfo &r = fleet[uid];
-
-    int row = -1;
+void MainWindow::ensureRobotRowExists(const QString &uid) {
     for (int i = 0; i < fleetTable->rowCount(); ++i) {
-        if (fleetTable->item(i, 0)->data(Qt::UserRole).toString() == uid) {
-            row = i;
-            break;
-        }
+        if (fleetTable->item(i, 0)->data(Qt::UserRole).toString() == uid) return;
     }
 
-    if (row == -1) {
-        row = fleetTable->rowCount();
-        fleetTable->insertRow(row);
+    updatingTableProgrammatically = true;
+    int row = fleetTable->rowCount();
+    fleetTable->insertRow(row);
 
-        auto *chkItem = new QTableWidgetItem();
-        chkItem->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
-        chkItem->setCheckState(r.selected ? Qt::Checked : Qt::Unchecked);
-        chkItem->setData(Qt::UserRole, uid);
-        fleetTable->setItem(row, 0, chkItem);
+    auto *chkItem = new QTableWidgetItem();
+    chkItem->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+    chkItem->setCheckState(fleet[uid].selected ? Qt::Checked : Qt::Unchecked);
+    chkItem->setData(Qt::UserRole, uid);
+    fleetTable->setItem(row, 0, chkItem);
 
-        for (int col = 1; col < 10; ++col) {
-            auto *item = new QTableWidgetItem();
-            if (col != 1) item->setFlags(item->flags() & ~Qt::ItemIsEditable);
-            item->setTextAlignment(Qt::AlignCenter);
-            fleetTable->setItem(row, col, item);
-        }
+    for (int col = 1; col < 10; ++col) {
+        auto *item = new QTableWidgetItem();
+        if (col != 1) item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+        item->setTextAlignment(Qt::AlignCenter);
+        fleetTable->setItem(row, col, item);
     }
-
-    fleetTable->item(row, 1)->setText(r.name);
-    fleetTable->item(row, 2)->setText(r.ip);
-    fleetTable->item(row, 3)->setText("v" + r.version);
-    fleetTable->item(row, 5)->setText(r.mode);
-    fleetTable->item(row, 5)->setForeground(r.mode.contains("RUN") ? QColor("#4ec9b0") : QColor("#ce9178"));
-    fleetTable->item(row, 6)->setText(QString::number(r.dist, 'f', 1));
-    fleetTable->item(row, 7)->setText(QString::number(r.spd, 'f', 1));
-    fleetTable->item(row, 8)->setText(QString::number(r.freespeed, 'f', 1));
-    fleetTable->item(row, 9)->setText(QString("%1 / %2").arg(r.acc, 0, 'f', 2).arg(r.brake, 0, 'f', 2));
-
     updatingTableProgrammatically = false;
-    refreshTableStatus();
 }
 
 void MainWindow::refreshTableStatus() {
+    // Co 3 sekundy (co 6 wywołań po 500 ms) odświeżamy cache interfejsów sieciowych
+    if (++netCacheTickCounter >= 6) {
+        netCacheTickCounter = 0;
+        updateNetworkCache();
+    }
+
     updatingTableProgrammatically = true;
     qint64 now = QDateTime::currentMSecsSinceEpoch();
     int onlineCount = 0;
@@ -1761,15 +2009,30 @@ void MainWindow::refreshTableStatus() {
         const RobotInfo &r = fleet[uid];
         if (r.selected) selectedCount++;
 
+        // Aktualizujemy tylko te komórki, których tekst faktycznie się zmienił
+        auto setIfDiff = [&](int col, const QString &val) {
+            QTableWidgetItem *it = fleetTable->item(row, col);
+            if (it && it->text() != val) it->setText(val);
+        };
+
+        setIfDiff(1, r.name);
+        setIfDiff(2, r.ip);
+        setIfDiff(3, "v" + r.version);
+        setIfDiff(5, r.mode);
+        fleetTable->item(row, 5)->setForeground(r.mode.contains("RUN") ? QColor("#4ec9b0") : QColor("#ce9178"));
+        setIfDiff(6, QString::number(r.dist, 'f', 1));
+        setIfDiff(7, QString::number(r.spd, 'f', 1));
+        setIfDiff(8, QString::number(r.freespeed, 'f', 1));
+        setIfDiff(9, QString("%1 / %2").arg(r.acc, 0, 'f', 2).arg(r.brake, 0, 'f', 2));
+
         qint64 ageSec = (now - r.lastSeenMs) / 1000;
         QTableWidgetItem *statusItem = fleetTable->item(row, 4);
-
         if (ageSec < 5) {
             onlineCount++;
-            statusItem->setText(QString("🟢 ONLINE (%1s)").arg(ageSec));
+            setIfDiff(4, QString("🟢 ONLINE (%1s)").arg(ageSec));
             statusItem->setForeground(QColor("#6a9955"));
         } else {
-            statusItem->setText(QString("🔴 OFFLINE (%1s)").arg(ageSec));
+            setIfDiff(4, QString("🔴 OFFLINE (%1s)").arg(ageSec));
             statusItem->setForeground(QColor("#f44747"));
         }
     }
@@ -1778,7 +2041,7 @@ void MainWindow::refreshTableStatus() {
                                    .arg(fleet.size()).arg(onlineCount).arg(selectedCount).arg(macToIp.size()));
     updatingTableProgrammatically = false;
 
-    if (!cameraTimer->isActive()) {
+    if (!cameraThread) {
         rebuildVisionTable();
     }
 }
@@ -1851,8 +2114,7 @@ void MainWindow::loadRobotDatabase() {
             QJsonObject leases = it.value().toObject();
             for (auto lit = leases.begin(); lit != leases.end(); ++lit) {
                 const QString ip = lit.value().toString();
-                if (ip.startsWith(SUBNET_PREFIX))
-                    macToIp[lit.key()] = ip;
+                if (ip.startsWith(SUBNET_PREFIX)) macToIp[lit.key()] = ip;
             }
         } else if (it.value().isString()) {
             uidToName[it.key()] = it.value().toString();
@@ -1862,13 +2124,9 @@ void MainWindow::loadRobotDatabase() {
 
 void MainWindow::saveRobotDatabase() {
     QJsonObject obj;
-    for (auto it = uidToName.begin(); it != uidToName.end(); ++it) {
-        obj[it.key()] = it.value();
-    }
+    for (auto it = uidToName.begin(); it != uidToName.end(); ++it) obj[it.key()] = it.value();
     QJsonObject leases;
-    for (auto it = macToIp.begin(); it != macToIp.end(); ++it) {
-        leases[it.key()] = it.value();
-    }
+    for (auto it = macToIp.begin(); it != macToIp.end(); ++it) leases[it.key()] = it.value();
     obj["dhcp_leases"] = leases;
 
     QFile file(DB_FILENAME);
@@ -1901,9 +2159,7 @@ void MainWindow::loadArenaConfig() {
 
 void MainWindow::saveArenaConfig() {
     QJsonArray arr;
-    for (const auto &c : flockingSim.getCornersNorm()) {
-        arr.append(QJsonArray{c.x, c.y});
-    }
+    for (const auto &c : flockingSim.getCornersNorm()) arr.append(QJsonArray{c.x, c.y});
     QJsonObject obj{
         {"corners_norm", arr},
         {"width_cm", flockingSim.getArenaWidthCm()},

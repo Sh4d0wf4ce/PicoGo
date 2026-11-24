@@ -24,6 +24,7 @@ void setDarkTheme(QApplication &app) {
 }
 
 int main(int argc, char *argv[]) {
+    qputenv("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0");
     QApplication app(argc, argv);
     setDarkTheme(app);
 

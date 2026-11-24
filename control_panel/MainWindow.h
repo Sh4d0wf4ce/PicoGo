@@ -5,6 +5,7 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTimer>
+#include <QThread>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QPlainTextEdit>
@@ -18,16 +19,57 @@
 #include <QAction>
 #include <QMouseEvent>
 #include <QWheelEvent>
+#include <QImage>
 #include <QMap>
 #include <QVector>
 #include <QPointF>
 #include <QDateTime>
 #include <QNetworkInterface>
+#include <atomic>
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/objdetect/aruco_detector.hpp>
 
 #include "FlockingSim.h"
+
+struct DetectedMarker {
+    int markerId = -1;
+    double centerX = 0.0;
+    double centerY = 0.0;
+    double rawAngleDeg = 0.0;
+    int missedFrames = 0;
+    bool isHeld() const { return missedFrames > 0; }
+};
+Q_DECLARE_METATYPE(DetectedMarker)
+Q_DECLARE_METATYPE(QVector<DetectedMarker>)
+
+// Osobny wątek przechwytywania wideo i detekcji ArUco (zero lagów w GUI)
+class CameraThread : public QThread {
+    Q_OBJECT
+public:
+    CameraThread(int camIdx, int reqW, int reqH, QObject *parent = nullptr);
+    ~CameraThread() override { stopCapture(); }
+
+    void stopCapture();
+    void markGuiReady() { guiBusy.store(false, std::memory_order_release); }
+    void setDebugRejected(bool enabled) { debugRejected.store(enabled, std::memory_order_relaxed); }
+
+signals:
+    void cameraOpened(const QString &infoText, int realW, int realH);
+    void cameraError(const QString &errMsg);
+    void frameProcessed(const QImage &rgbFrame, const QVector<DetectedMarker> &markers, double fps);
+
+protected:
+    void run() override;
+
+private:
+    int cameraIndex;
+    int requestedWidth;
+    int requestedHeight;
+    std::atomic<bool> running{false};
+    std::atomic<bool> guiBusy{false};
+    std::atomic<bool> debugRejected{false};
+};
 
 class ClickableVideoLabel : public QLabel {
     Q_OBJECT
@@ -113,13 +155,16 @@ struct VisionTrack {
     double centerX = 0.0;
     double centerY = 0.0;
     double angleDeg = 0.0;
+    int missedFrames = 0;
     qint64 lastSeenMs = 0;
 
+    // Pamięć regulatora PD + wygładzania
     double smoothedSpeed = 0.0;
     double smoothedTurn = 0.0;
     double prevError = 0.0;
     double filteredErrorRate = 0.0;
     qint64 lastControlMs = 0;
+    bool hasPrevError = false;
 };
 
 class MainWindow : public QMainWindow {
@@ -137,7 +182,7 @@ private slots:
     void toggleDhcpServer(bool enabled);
     void refreshTableStatus();
 
-    // Zakładka 1: Zaznaczanie, sterowanie IDM, PID i OTA
+    // Zakładka 1: IDM, PID i OTA
     void selectAllRobots();
     void deselectAllRobots();
     void selectOnlineRobots();
@@ -152,10 +197,12 @@ private slots:
     void browseOtaFile();
     void sendOtaCommand();
 
-    // Zakładka 2: Kamera ArUco, interaktywne koło i ławica ryb (Boids)
+    // Zakładka 2: Kamera ArUco (z wątku), Koło i Ławica ryb
     void refreshCameras();
     void toggleCamera();
-    void processCameraFrame();
+    void onCameraOpened(const QString &infoText, int realW, int realH);
+    void onCameraError(const QString &errMsg);
+    void onCameraFrameReady(const QImage &rgbFrame, const QVector<DetectedMarker> &markers, double fps);
     void onVideoImageClicked(double x, double y);
     void onVideoImageDragged(double x, double y);
     void onVideoWheelScrolled(int delta);
@@ -178,7 +225,7 @@ private:
     void saveRobotDatabase();
     void loadArenaConfig();
     void saveArenaConfig();
-    void updateTableRow(const QString &uid);
+    void ensureRobotRowExists(const QString &uid);
     void rebuildVisionTable();
     void logMessage(const QString &msg);
 
@@ -187,14 +234,15 @@ private:
     void sendVisionDriveCmd(int markerId, double speed, double turn);
     QList<QString> getTargetUids(bool forceAll = false) const;
     QString allocateIpForMac(const QString &mac);
-    bool findServerInterface(QNetworkAddressEntry *entry = nullptr, int *ifaceIndex = nullptr) const;
+    void updateNetworkCache();
     void checkNetworkSetup();
 
     QString findRobotUidByMarkerId(int markerId) const;
     static int extractNumberFromName(const QString &name);
 
     void stepVisionControl(int frameW, int frameH);
-    bool driveMarkerToPoint(VisionTrack &tr, QPointF target, double speedCap);
+    bool driveMarkerToPoint(VisionTrack &tr, QPointF target, double speedCap, double pxScale);
+    void resetTrackMemory(VisionTrack &tr);
     static double normalizeAngleDeg(double a);
 
     // Stałe portów i adresacji
@@ -203,9 +251,9 @@ private:
     static constexpr quint16 HTTP_OTA_PORT    = 8000;
     static constexpr quint16 DHCP_SERVER_PORT = 67;
     static constexpr quint16 DHCP_CLIENT_PORT = 68;
-    const QString SUBNET_PREFIX = "192.168.1.";
-    const QString SERVER_ETH_IP = SUBNET_PREFIX + "1";
-    const QString DB_FILENAME   = "znane_roboty.json";
+    const QString SUBNET_PREFIX  = "192.168.1.";
+    const QString SERVER_ETH_IP  = SUBNET_PREFIX + "1";
+    const QString DB_FILENAME    = "znane_roboty.json";
     const QString ARENA_FILENAME = "arena_config.json";
 
     // Gniazda sieciowe i timery
@@ -214,6 +262,13 @@ private:
     QUdpSocket *udpDhcpSocket = nullptr;
     QTcpServer *httpOtaServer = nullptr;
     QTimer *statusTimer = nullptr;
+
+    // Cache interfejsów sieciowych (odświeżany co 3 s zamiast przy każdym pakiecie DHCP!)
+    bool cachedServerValid = false;
+    int cachedServerIfaceIdx = -1;
+    QHostAddress cachedServerBroadcast;
+    QStringList cachedAllBroadcasts;
+    int netCacheTickCounter = 0;
 
     // Dane floty oraz pula adresów serwera DHCP
     QMap<QString, RobotInfo> fleet;
@@ -260,7 +315,10 @@ private:
     // --- Zakładka 2 (Kamera ArUco, Koło & Ławica ryb) ---
     QComboBox *comboCamera = nullptr;
     QComboBox *comboResolution = nullptr;
+    QPushButton *btnRefreshCam = nullptr;
     QPushButton *btnToggleCamera = nullptr;
+    QCheckBox *chkDebugAruco = nullptr;
+    QLabel *lblCameraFps = nullptr;
     QSpinBox *spinHeadingOffset = nullptr;
     QComboBox *comboTurnSign = nullptr;
     QSpinBox *spinCircleRadius = nullptr;
@@ -270,7 +328,7 @@ private:
     QTableWidget *visionTable = nullptr;
     QLabel *lblVisionStatus = nullptr;
 
-    // Parametry ławicy ryb (Boids) i areny
+    // Parametry ławicy ryb (flocking_2.py) i areny
     QDoubleSpinBox *spinArenaW = nullptr;
     QDoubleSpinBox *spinArenaH = nullptr;
     QDoubleSpinBox *spinFlockSpeed = nullptr;
@@ -280,13 +338,12 @@ private:
     QDoubleSpinBox *spinFlockTurnR = nullptr;
     QSpinBox *spinPreviewCount = nullptr;
 
-    cv::VideoCapture cameraCap;
-    QTimer *cameraTimer = nullptr;
-    cv::aruco::ArucoDetector arucoDetector;
+    CameraThread *cameraThread = nullptr;
     QMap<int, VisionTrack> visionTracks;
     QList<int> lastVisionTableIds;
-    int lastFrameW = 1280;
-    int lastFrameH = 720;
+    qint64 lastVisionTableUpdateMs = 0;
+    int lastFrameW = 1920;
+    int lastFrameH = 1080;
 
     enum class VisionMode {
         None,
@@ -307,7 +364,6 @@ private:
     bool circleCenterInitialized = false;
     double circleRadius = 180.0;
 
-    // Kalibracja 4 rogów i instancja symulacji ławicy
     FlockingSim flockingSim;
     bool arenaCalibrating = false;
     QVector<QPointF> arenaClickPoints;
