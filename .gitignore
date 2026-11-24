@@ -11,6 +11,7 @@ build.ninja
 .ninja_log
 compile_commands.json
 znane_roboty.json
+arena_config.json
 
 # Pliki automatycznie generowane przez Qt (MOC / UIC / RCC)
 *_autogen/

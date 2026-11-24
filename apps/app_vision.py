@@ -1,58 +1,18 @@
-# apps/app_vision.py - Sterowanie wizyjne z kamery ArUco + pełna obsługa OTA i telemetrii
+# apps/app_vision.py - Sterowanie wizyjne z kamery ArUco + natywna obsługa OTA przez main.py
 import socket
 import json
 import time
 import machine
-import ubinascii
 from Motor import PicoGo
 
-APP_VERSION = "vision_1.0"
+APP_VERSION = "vision_1.1"
 
 UDP_LISTEN_PORT = 5005
 UDP_TELEMETRY_PORT = 5006
-SERVER_IP = "192.168.1.1"
+DEFAULT_SERVER_IP = "192.168.1.1"
 
 # Watchdog: jeśli przez 400 ms nie przyjdzie komenda z kamery, zatrzymaj silniki
 WATCHDOG_TIMEOUT_MS = 400
-
-
-def get_uid():
-    return ubinascii.hexlify(machine.unique_id()).decode()
-
-
-def perform_ota_update(server_ip, port):
-    print(f"[OTA] Pobieranie nowego kodu z {server_ip}:{port}...")
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(5.0)
-    try:
-        s.connect((server_ip, int(port)))
-        s.send(b"GET /app.py HTTP/1.0\r\nHost: " + server_ip.encode() + b"\r\n\r\n")
-        chunks = []
-        while True:
-            data = s.recv(1024)
-            if not data:
-                break
-            chunks.append(data)
-        s.close()
-        raw = b"".join(chunks)
-        header_end = raw.find(b"\r\n\r\n")
-        if header_end != -1:
-            body = raw[header_end + 4:]
-            if len(body) > 50:
-                with open("app.py.tmp", "wb") as f:
-                    f.write(body)
-                import os
-                os.rename("app.py.tmp", "app.py")
-                print("[OTA] Sukces! Restartuję robota...")
-                time.sleep(0.3)
-                machine.reset()
-    except Exception as e:
-        print("[OTA BŁĄD]", e)
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
 
 
 def apply_differential_drive(motor, speed, turn):
@@ -61,15 +21,12 @@ def apply_differential_drive(motor, speed, turn):
     na sygnał PWM (-100..100) dla lewego i prawego koła.
     """
     if abs(speed) < 0.01 and abs(turn) < 0.01:
-        motor.stop()
+        motor.setMotor(0, 0)
         return 0.0
 
-    # W układzie współrzędnych obrazu (oś Y skierowana w dół) dodatni skręt (turn > 0)
-    # oznacza obrót zgodnie z ruchem wskazówek zegara (lewe koło szybciej, prawe wolniej)
     left_val = (speed + turn) * 100.0
     right_val = (speed - turn) * 100.0
 
-    # Nasycenie do zakresu [-100, 100]
     left_pwm = int(max(-100, min(100, round(left_val))))
     right_pwm = int(max(-100, min(100, round(right_val))))
 
@@ -79,8 +36,8 @@ def apply_differential_drive(motor, speed, turn):
 
 def run(wlan=None):
     M = PicoGo()
-    M.stop()
-    uid = get_uid()
+    M.setMotor(0, 0)
+    uid = machine.unique_id().hex()
 
     # Gniazdo odbierające komendy (port 5005)
     rx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -92,47 +49,59 @@ def run(wlan=None):
     tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     tx_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
+    server_ip = DEFAULT_SERVER_IP
     mode = "VISION_IDLE"
     current_spd = 0.0
     last_cmd_ms = time.ticks_ms()
     last_hello_ms = 0
+    last_seq = None
 
     print(f"[APP_VISION] Uruchomiono v{APP_VERSION} (UID: {uid})")
 
     while True:
         now = time.ticks_ms()
 
-        # 1. Odbiór wszystkich oczekujących pakietów UDP (bierzemy najświeższy)
+        # 1. Odbiór wszystkich oczekujących pakietów UDP
         while True:
             try:
                 data, addr = rx_sock.recvfrom(512)
             except OSError:
                 break
 
+            server_ip = addr[0]
+
             try:
                 msg = json.loads(data.decode("utf-8"))
             except Exception:
                 continue
 
+            # Pomijanie duplikatów komend z numerem seq (broadcast + unicast)
+            seq = msg.get("seq")
+            if seq is not None:
+                if seq == last_seq:
+                    continue
+                last_seq = seq
+
             cmd = msg.get("cmd", "")
             msg_type = msg.get("type", "")
 
-            # Obsługa bezprzewodowej aktualizacji OTA z naszego panelu C++
+            # Przekazanie OTA do bootloadera main.py (identycznie jak w app_idm.py - bez machine.reset!)
             if cmd == "OTA_UPDATE":
-                M.stop()
-                port = msg.get("port", 8000)
-                perform_ota_update(addr[0], port)
+                M.setMotor(0, 0)
+                rx_sock.close()
+                tx_sock.close()
+                return ("OTA", server_ip, msg.get("port", 8000))
 
-            # Obsługa identyfikacji (krótki bączek z Zakładki 1 lub Zakładki 2)
+            # Obsługa identyfikacji (krótki bączek)
             elif cmd == "SPIN" or msg_type == "identify":
                 dur = float(msg.get("duration", 0.4))
                 pwr = int(msg.get("power", 40))
                 M.setMotor(pwr, -pwr)
                 time.sleep(dur)
-                M.stop()
+                M.setMotor(0, 0)
                 last_cmd_ms = time.ticks_ms()
 
-            # Komenda jazdy z kamery ArUco (nasz format VISION_DRIVE oraz format profesora type=="cmd")
+            # Komenda jazdy z kamery ArUco
             elif cmd == "VISION_DRIVE" or msg_type == "cmd":
                 spd = float(msg.get("speed", 0.0))
                 trn = float(msg.get("turn", 0.0))
@@ -140,21 +109,21 @@ def run(wlan=None):
                 last_cmd_ms = now
                 mode = "VISION_RUN" if current_spd > 0 else "VISION_IDLE"
 
-            # Obsługa przycisku STOP (Spacja) z naszego panelu C++
+            # Obsługa przycisku STOP (Spacja)
             elif "params" in msg:
                 p = msg["params"]
                 if p.get("mode") == "IDLE":
-                    M.stop()
+                    M.setMotor(0, 0)
                     current_spd = 0.0
                     mode = "VISION_IDLE"
 
-        # 2. Watchdog bezpieczeństwa (zatrzymaj robota, gdy kamera przestanie nadawać)
+        # 2. Watchdog bezpieczeństwa
         if mode == "VISION_RUN" and time.ticks_diff(now, last_cmd_ms) > WATCHDOG_TIMEOUT_MS:
-            M.stop()
+            M.setMotor(0, 0)
             current_spd = 0.0
             mode = "VISION_IDLE"
 
-        # 3. Wysyłanie meldunku HELLO co 800 ms do aplikacji C++
+        # 3. Wysyłanie meldunku HELLO co 800 ms
         if time.ticks_diff(now, last_hello_ms) >= 800:
             last_hello_ms = now
             hello_pkt = json.dumps({
@@ -171,7 +140,7 @@ def run(wlan=None):
                 }
             }).encode("utf-8")
             try:
-                tx_sock.sendto(hello_pkt, (SERVER_IP, UDP_TELEMETRY_PORT))
+                tx_sock.sendto(hello_pkt, (server_ip, UDP_TELEMETRY_PORT))
                 tx_sock.sendto(hello_pkt, ("255.255.255.255", UDP_TELEMETRY_PORT))
             except Exception:
                 pass
