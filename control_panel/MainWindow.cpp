@@ -20,9 +20,12 @@
 #include <QShortcut>
 #include <QRegularExpression>
 #include <QElapsedTimer>
+#include <QInputDialog>
+#include <QMutexLocker>
 #include <QtEndian>
 #include <cmath>
 #include <algorithm>
+#include <map>
 #include <set>
 
 static constexpr double kPi = 3.14159265358979323846;
@@ -37,6 +40,12 @@ void CameraThread::stopCapture() {
     if (isRunning()) {
         wait(3000);
     }
+}
+
+void CameraThread::setArenaRoi(bool enabled, const QRectF &roiNorm) {
+    QMutexLocker locker(&roiMutex);
+    useArenaRoi = enabled;
+    arenaRoiNorm = roiNorm;
 }
 
 void CameraThread::run() {
@@ -105,13 +114,13 @@ void CameraThread::run() {
                        .arg(realFps, 0, 'f', 1).arg(realFourcc, backendName);
     emit cameraOpened(info, realW, realH);
 
-    // Parametry detektora z vehicle_tracker_2.py (zoptymalizowane pod większy zasięg i odblaski)
+    // Parametry detektora zoptymalizowane pod zasięg, odblaski i wyższy FPS
     cv::aruco::DetectorParameters params;
     params.minMarkerPerimeterRate = 0.02;
     params.polygonalApproxAccuracyRate = 0.05;
-    params.adaptiveThreshWinSizeMin = 3;
-    params.adaptiveThreshWinSizeMax = 33;
-    params.adaptiveThreshWinSizeStep = 6;
+    params.adaptiveThreshWinSizeMin = 5;
+    params.adaptiveThreshWinSizeMax = 29;
+    params.adaptiveThreshWinSizeStep = 8;
     params.perspectiveRemovePixelPerCell = 8;
     params.errorCorrectionRate = 0.6;
     params.minOtsuStdDev = 3.0;
@@ -147,7 +156,7 @@ void CameraThread::run() {
             continue;
         }
 
-        // Opróżnianie przestarzałych klatek z bufora sterownika (jak w swarm_controller_2.py)
+        // Opróżnianie przestarzałych klatek z bufora sterownika
         if (readTimer.elapsed() <= 8) {
             int drained = 0;
             for (int k = 0; k < 5; ++k) {
@@ -164,12 +173,32 @@ void CameraThread::run() {
             }
         }
 
-        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+        // Opcjonalne zawężenie detekcji ArUco do prostokąta ROI areny (wyższe FPS)
+        cv::Rect roiRect(0, 0, frame.cols, frame.rows);
+        {
+            QMutexLocker locker(&roiMutex);
+            if (useArenaRoi && arenaRoiNorm.isValid() &&
+                arenaRoiNorm.width() > 0.05 && arenaRoiNorm.height() > 0.05) {
+                int x = std::clamp(int(std::floor(arenaRoiNorm.left() * frame.cols)), 0, frame.cols - 2);
+                int y = std::clamp(int(std::floor(arenaRoiNorm.top() * frame.rows)), 0, frame.rows - 2);
+                int w = std::clamp(int(std::ceil(arenaRoiNorm.width() * frame.cols)), 2, frame.cols - x);
+                int h = std::clamp(int(std::ceil(arenaRoiNorm.height() * frame.rows)), 2, frame.rows - y);
+                roiRect = cv::Rect(x, y, w, h);
+            }
+        }
+
+        cv::cvtColor(frame(roiRect), gray, cv::COLOR_BGR2GRAY);
 
         std::vector<int> ids;
         std::vector<std::vector<cv::Point2f>> corners;
         std::vector<std::vector<cv::Point2f>> rejected;
         detector.detectMarkers(gray, corners, ids, rejected);
+
+        if (roiRect.x != 0 || roiRect.y != 0) {
+            cv::Point2f off(static_cast<float>(roiRect.x), static_cast<float>(roiRect.y));
+            for (auto &c : corners)  for (auto &pt : c) pt += off;
+            for (auto &r : rejected) for (auto &pt : r) pt += off;
+        }
 
         std::set<int> rawIds;
         std::set<int> seenKnown;
@@ -238,18 +267,27 @@ void CameraThread::run() {
                     if (rej.size() != 4) continue;
                     std::vector<cv::Point> poly;
                     for (const auto &p : rej) poly.emplace_back(std::lround(p.x), std::lround(p.y));
-                    cv::polylines(frame, poly, true, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+                    cv::polylines(frame, poly, true, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
                 }
             }
 
-            cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
+            // Sam podgląd skalujemy do max 960 px szerokości (detekcja wyżej nadal szła w pełnym 1080p)
+            cv::Mat previewSrc;
+            if (frame.cols > 960) {
+                int newH = std::max(2, frame.rows * 960 / frame.cols);
+                cv::resize(frame, previewSrc, cv::Size(960, newH), 0, 0, cv::INTER_LINEAR);
+            } else {
+                previewSrc = frame;
+            }
+
+            cv::cvtColor(previewSrc, rgb, cv::COLOR_BGR2RGB);
             QImage qimg(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888);
             QVector<DetectedMarker> outMarkers;
             outMarkers.reserve(known.size());
             for (auto it = known.constBegin(); it != known.constEnd(); ++it) {
                 outMarkers.push_back(it.value());
             }
-            emit frameProcessed(qimg.copy(), outMarkers, currentFps);
+            emit frameProcessed(qimg.copy(), frame.cols, frame.rows, outMarkers, currentFps);
         }
     }
 
@@ -591,7 +629,7 @@ QWidget* MainWindow::createVisionTab() {
     vbox->setContentsMargins(6, 6, 6, 6);
     vbox->setSpacing(6);
 
-    // Wiersz 1: Kamera, debug ArUco, korekta kąta i STOP
+    // Wiersz 1: Kamera, debug ArUco, ROI, FPS, korekta kąta i STOP
     auto *row1 = new QHBoxLayout();
     comboCamera = new QComboBox();
     comboResolution = new QComboBox();
@@ -607,6 +645,11 @@ QWidget* MainWindow::createVisionTab() {
     connect(chkDebugAruco, &QCheckBox::toggled, this, [this](bool on) {
         if (cameraThread) cameraThread->setDebugRejected(on);
     });
+
+    chkUseArenaRoi = new QCheckBox("ROI areny (FPS)");
+    chkUseArenaRoi->setToolTip("Szuka kodów ArUco tylko w obszarze skalibrowanej areny (+8% zapasu), przyspieszając FPS.");
+    chkUseArenaRoi->setChecked(false);
+    connect(chkUseArenaRoi, &QCheckBox::toggled, this, &MainWindow::updateCameraRoi);
 
     lblCameraFps = new QLabel("FPS: --");
     lblCameraFps->setStyleSheet("font-weight: bold; color: #4ec9b0;");
@@ -633,6 +676,7 @@ QWidget* MainWindow::createVisionTab() {
     row1->addWidget(btnRefreshCam);
     row1->addWidget(btnToggleCamera);
     row1->addWidget(chkDebugAruco);
+    row1->addWidget(chkUseArenaRoi);
     row1->addSpacing(8);
     row1->addWidget(lblCameraFps);
     row1->addSpacing(10);
@@ -685,8 +729,7 @@ QWidget* MainWindow::createVisionTab() {
     vbox->addLayout(row2);
 
     lblVisionStatus = new QLabel(
-        "Mapowanie: PICO_X = ArUco #X. Wybierz rozdzielczość przed kliknięciem 'Start kamery'. "
-        "Zaznacz robota w tabeli i kliknij na obraz (cel), dopasuj okrąg lub uruchom Ławicę ryb (model A)."
+        "Mapowanie: PICO_X = ArUco #X. Wyznacz arenę (4 rogi + wymiary w cm), potem uruchom Ławicę ryb (model A)."
     );
     lblVisionStatus->setStyleSheet("color: #dcdcaa; font-weight: bold;");
     vbox->addWidget(lblVisionStatus);
@@ -716,7 +759,7 @@ QWidget* MainWindow::createVisionTab() {
     connect(visionTable, &QTableWidget::itemSelectionChanged, this, &MainWindow::onVisionTableSelectionChanged);
     rightCol->addWidget(visionTable, 1);
 
-    // Panel symulacji Ławicy ryb (Model A z flocking_2.py)
+    // Panel symulacji Ławicy ryb (Model A z flocking_2.py + elastyczna smycz)
     auto *flockGroup = new QGroupBox("🐟 Symulacja ławicy ryb – model A (parametry na żywo)");
     flockGroup->setFixedWidth(450);
     auto *fg = new QGridLayout(flockGroup);
@@ -763,6 +806,12 @@ QWidget* MainWindow::createVisionTab() {
     spinPreviewCount->setRange(1, 30);
     spinPreviewCount->setValue(8);
 
+    spinMaxLeadCm = new QDoubleSpinBox();
+    spinMaxLeadCm->setRange(5.0, 60.0);
+    spinMaxLeadCm->setSingleStep(1.0);
+    spinMaxLeadCm->setValue(flockingSim.params.maxLeadCm);
+    spinMaxLeadCm->setSuffix(" cm");
+
     auto *btnFlockPreview = new QPushButton("👁 Podgląd ławicy (Bez robotów)");
     btnFlockPreview->setMinimumHeight(30);
     btnFlockPreview->setStyleSheet("background-color: #2b7a78; color: white; font-weight: bold;");
@@ -778,6 +827,7 @@ QWidget* MainWindow::createVisionTab() {
     connect(spinFlockSep, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::updateFlockingParamsFromUi);
     connect(spinFlockAlign, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::updateFlockingParamsFromUi);
     connect(spinFlockCoh, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::updateFlockingParamsFromUi);
+    connect(spinMaxLeadCm, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::updateFlockingParamsFromUi);
     connect(btnFlockPreview, &QPushButton::clicked, this, &MainWindow::startFlockingPreview);
     connect(btnFlockStart, &QPushButton::clicked, this, &MainWindow::startFlockingRobots);
 
@@ -801,8 +851,11 @@ QWidget* MainWindow::createVisionTab() {
     fg->addWidget(new QLabel("Wirt. ryb:"), 3, 2);
     fg->addWidget(spinPreviewCount, 3, 3);
 
-    fg->addWidget(btnFlockPreview, 4, 0, 1, 2);
-    fg->addWidget(btnFlockStart, 4, 2, 1, 2);
+    fg->addWidget(new QLabel("Dystans kropki:"), 4, 0);
+    fg->addWidget(spinMaxLeadCm, 4, 1);
+
+    fg->addWidget(btnFlockPreview, 5, 0, 1, 2);
+    fg->addWidget(btnFlockStart, 5, 2, 1, 2);
 
     rightCol->addWidget(flockGroup);
     contentRow->addLayout(rightCol);
@@ -899,6 +952,26 @@ void MainWindow::refreshCameras() {
     }
 }
 
+void MainWindow::updateCameraRoi() {
+    if (!cameraThread) return;
+    bool enable = chkUseArenaRoi && chkUseArenaRoi->isChecked() && !arenaCalibrating;
+    if (!enable) {
+        cameraThread->setArenaRoi(false, QRectF());
+        return;
+    }
+    auto c = flockingSim.getCornersNorm();
+    float minX = 1.0f, maxX = 0.0f, minY = 1.0f, maxY = 0.0f;
+    for (const auto &pt : c) {
+        minX = std::min(minX, pt.x); maxX = std::max(maxX, pt.x);
+        minY = std::min(minY, pt.y); maxY = std::max(maxY, pt.y);
+    }
+    minX = std::max(0.0f, minX - 0.08f);
+    minY = std::max(0.0f, minY - 0.08f);
+    maxX = std::min(1.0f, maxX + 0.08f);
+    maxY = std::min(1.0f, maxY + 0.08f);
+    cameraThread->setArenaRoi(true, QRectF(minX, minY, maxX - minX, maxY - minY));
+}
+
 void MainWindow::toggleCamera() {
     if (cameraThread != nullptr) {
         stopVisionAll();
@@ -922,7 +995,6 @@ void MainWindow::toggleCamera() {
     int camIdx = comboCamera->currentData().toInt();
     QSize res = comboResolution->currentData().toSize();
 
-    // Blokujemy kontrolki kamery na czas działania strumienia (naprawia freeze przy 'Odśwież')
     comboCamera->setEnabled(false);
     comboResolution->setEnabled(false);
     btnRefreshCam->setEnabled(false);
@@ -931,6 +1003,7 @@ void MainWindow::toggleCamera() {
 
     cameraThread = new CameraThread(camIdx, res.width(), res.height(), this);
     cameraThread->setDebugRejected(chkDebugAruco->isChecked());
+    updateCameraRoi();
     connect(cameraThread, &CameraThread::cameraOpened, this, &MainWindow::onCameraOpened);
     connect(cameraThread, &CameraThread::cameraError, this, &MainWindow::onCameraError);
     connect(cameraThread, &CameraThread::frameProcessed, this, &MainWindow::onCameraFrameReady);
@@ -959,18 +1032,18 @@ double MainWindow::normalizeAngleDeg(double a) {
     return r - 180.0;
 }
 
-void MainWindow::onCameraFrameReady(const QImage &rgbFrame, const QVector<DetectedMarker> &markers, double fps) {
+void MainWindow::onCameraFrameReady(const QImage &previewRgb, int origW, int origH,
+                                    const QVector<DetectedMarker> &markers, double fps) {
     if (!cameraThread) return;
 
-    // Gwarantuje zwolnienie bramki wątku kamery przy wyjściu z funkcji
     struct ReadyGuard {
         CameraThread *t;
         ~ReadyGuard() { if (t) t->markGuiReady(); }
     } guard{cameraThread};
 
-    if (rgbFrame.isNull()) return;
-    lastFrameW = rgbFrame.width();
-    lastFrameH = rgbFrame.height();
+    if (previewRgb.isNull() || origW <= 0 || origH <= 0) return;
+    lastFrameW = origW;
+    lastFrameH = origH;
 
     if (!circleCenterInitialized) {
         circleCenter = QPointF(lastFrameW * 0.5, lastFrameH * 0.5);
@@ -980,7 +1053,7 @@ void MainWindow::onCameraFrameReady(const QImage &rgbFrame, const QVector<Detect
     qint64 now = QDateTime::currentMSecsSinceEpoch();
     double offsetDeg = spinHeadingOffset->value();
 
-    // 1. Aktualizacja torów na podstawie wykrytych/trzymanych znaczników z wątku kamery
+    // 1. Aktualizacja torów ze znaczników ArUco
     for (const auto &m : markers) {
         VisionTrack &tr = visionTracks[m.markerId];
         tr.markerId = m.markerId;
@@ -991,16 +1064,25 @@ void MainWindow::onCameraFrameReady(const QImage &rgbFrame, const QVector<Detect
         tr.lastSeenMs = now;
     }
 
-    // 2. Krok sterowania wizyjnego / ławicy ryb (działa nawet gdy użytkownik przełączył się na Zakładkę 1!)
+    // 2. Krok sterowania wizyjnego / ławicy ryb (działa także w tle na Zakładce 1)
     stepVisionControl(lastFrameW, lastFrameH);
 
-    // 3. Rysowanie podglądu wideo TYLKO gdy Zakładka 2 jest aktualnie widoczna (oszczędza CPU na Zakładce 1)
+    // 3. Rysowanie podglądu tylko gdy Zakładka 2 jest widoczna
     if (mainTabs->currentIndex() == 1) {
         lblCameraFps->setText(QString("FPS: %1 (%2x%3)").arg(fps, 0, 'f', 1).arg(lastFrameW).arg(lastFrameH));
 
-        QImage drawn = rgbFrame;
+        QImage drawn = previewRgb;
         QPainter p(&drawn);
         p.setRenderHint(QPainter::Antialiasing, true);
+        p.scale(double(drawn.width()) / origW, double(drawn.height()) / origH);
+
+        QFont labelFont("Consolas");
+        labelFont.setBold(true);
+        labelFont.setPixelSize(std::max(14, origW / 72));
+
+        QFont bannerFont("Consolas");
+        bannerFont.setBold(true);
+        bannerFont.setPixelSize(std::max(18, origW / 54));
 
         // Znaczniki ArUco
         for (const auto &m : markers) {
@@ -1010,42 +1092,41 @@ void MainWindow::onCameraFrameReady(const QImage &rgbFrame, const QVector<Detect
 
             double headingRad = normalizeAngleDeg(m.rawAngleDeg + offsetDeg) * kPi / 180.0;
             QPointF cPt(m.centerX, m.centerY);
-            QPointF endPt(m.centerX + 42.0 * std::cos(headingRad), m.centerY + 42.0 * std::sin(headingRad));
+            QPointF endPt(m.centerX + 46.0 * std::cos(headingRad), m.centerY + 46.0 * std::sin(headingRad));
 
-            p.setPen(QPen(col, 3));
+            p.setPen(QPen(col, 4));
             p.setBrush(col);
-            p.drawEllipse(cPt, 5, 5);
+            p.drawEllipse(cPt, 6, 6);
             p.drawLine(cPt, endPt);
 
-            // Grot strzałki
             double headA1 = headingRad + 2.6;
             double headA2 = headingRad - 2.6;
-            p.drawLine(endPt, QPointF(endPt.x() + 12.0 * std::cos(headA1), endPt.y() + 12.0 * std::sin(headA1)));
-            p.drawLine(endPt, QPointF(endPt.x() + 12.0 * std::cos(headA2), endPt.y() + 12.0 * std::sin(headA2)));
+            p.drawLine(endPt, QPointF(endPt.x() + 14.0 * std::cos(headA1), endPt.y() + 14.0 * std::sin(headA1)));
+            p.drawLine(endPt, QPointF(endPt.x() + 14.0 * std::cos(headA2), endPt.y() + 14.0 * std::sin(headA2)));
 
             QString label = online
                                 ? QString("PICO_%1 [.%2]").arg(m.markerId).arg(fleet[uid].ip.split('.').last())
                                 : QString("ArUco #%1").arg(m.markerId);
             if (m.isHeld()) label += " (hold)";
-            p.setFont(QFont("Consolas", 11, QFont::Bold));
-            p.drawText(QPointF(cPt.x() + 10, cPt.y() - 10), label);
+            p.setFont(labelFont);
+            p.drawText(QPointF(cPt.x() + 12, cPt.y() - 12), label);
         }
 
         // Kalibracja 4 rogów areny
         if (arenaCalibrating) {
-            p.setPen(QPen(QColor(255, 220, 0), 3));
+            p.setPen(QPen(QColor(255, 220, 0), 4));
             p.setBrush(QColor(255, 220, 0));
+            p.setFont(bannerFont);
             for (int i = 0; i < arenaClickPoints.size(); ++i) {
-                p.drawEllipse(arenaClickPoints[i], 7, 7);
-                p.drawText(arenaClickPoints[i] + QPointF(10, -8), QString::number(i + 1));
+                p.drawEllipse(arenaClickPoints[i], 9, 9);
+                p.drawText(arenaClickPoints[i] + QPointF(12, -10), QString::number(i + 1));
                 if (i > 0) p.drawLine(arenaClickPoints[i - 1], arenaClickPoints[i]);
             }
         } else if (visionMode == VisionMode::FlockingPreview || visionMode == VisionMode::FlockingRobots) {
-            // Ramka areny + strefy bezpieczeństwa z overlay_polygons()
             auto cornersN = flockingSim.getCornersNorm();
             QPolygonF arenaPoly;
             for (const auto &c : cornersN) arenaPoly << QPointF(c.x * lastFrameW, c.y * lastFrameH);
-            p.setPen(QPen(QColor(0, 220, 255), 3));
+            p.setPen(QPen(QColor(0, 220, 255), 4));
             p.setBrush(Qt::NoBrush);
             p.drawPolygon(arenaPoly);
 
@@ -1053,7 +1134,7 @@ void MainWindow::onCameraFrameReady(const QImage &rgbFrame, const QVector<Detect
                 QPolygonF poly;
                 for (const auto &pt : ov.pointsNorm) poly << QPointF(pt.x * lastFrameW, pt.y * lastFrameH);
                 QColor col(int(ov.colorBgr[2]), int(ov.colorBgr[1]), int(ov.colorBgr[0]));
-                p.setPen(QPen(col, ov.thickness, Qt::DashLine));
+                p.setPen(QPen(col, std::max(2, ov.thickness * 2), Qt::DashLine));
                 p.drawPolygon(poly);
             }
         }
@@ -1062,56 +1143,56 @@ void MainWindow::onCameraFrameReady(const QImage &rgbFrame, const QVector<Detect
         if (visionMode == VisionMode::Point && selectedMarkerId >= 0) {
             p.setPen(Qt::NoPen);
             p.setBrush(QColor(255, 40, 40));
-            p.drawEllipse(visionPointTarget, 10, 10);
+            p.drawEllipse(visionPointTarget, 12, 12);
         } else if (visionMode == VisionMode::FigureEight && !figure8Path.isEmpty()) {
-            p.setPen(QPen(QColor(255, 0, 255), 2));
+            p.setPen(QPen(QColor(255, 0, 255), 3));
             p.setBrush(Qt::NoBrush);
             p.drawPolygon(QPolygonF(figure8Path));
             p.setBrush(QColor(255, 40, 40));
-            p.drawEllipse(visionPointTarget, 9, 9);
+            p.drawEllipse(visionPointTarget, 11, 11);
         } else if (visionMode == VisionMode::CircleSetup || visionMode == VisionMode::Circle) {
             QColor cCol = (visionMode == VisionMode::CircleSetup) ? QColor(255, 255, 0) : QColor(0, 220, 255);
-            p.setPen(QPen(cCol, 2));
+            p.setPen(QPen(cCol, 3));
             p.setBrush(Qt::NoBrush);
             p.drawEllipse(circleCenter, circleRadius, circleRadius);
-            p.drawLine(circleCenter + QPointF(-10, 0), circleCenter + QPointF(10, 0));
-            p.drawLine(circleCenter + QPointF(0, -10), circleCenter + QPointF(0, 10));
+            p.drawLine(circleCenter + QPointF(-14, 0), circleCenter + QPointF(14, 0));
+            p.drawLine(circleCenter + QPointF(0, -14), circleCenter + QPointF(0, 14));
 
             int dir = comboCircleDir->currentData().toInt();
-            QPointF topPt(circleCenter.x(), std::max(15.0, circleCenter.y() - circleRadius));
-            QPointF tipPt(topPt.x() + dir * 42.0, topPt.y());
-            p.setPen(QPen(cCol, 3));
+            QPointF topPt(circleCenter.x(), std::max(20.0, circleCenter.y() - circleRadius));
+            QPointF tipPt(topPt.x() + dir * 50.0, topPt.y());
+            p.setPen(QPen(cCol, 4));
             p.drawLine(topPt, tipPt);
-            p.drawLine(tipPt, tipPt + QPointF(-dir * 10, -7));
-            p.drawLine(tipPt, tipPt + QPointF(-dir * 10,  7));
+            p.drawLine(tipPt, tipPt + QPointF(-dir * 12, -8));
+            p.drawLine(tipPt, tipPt + QPointF(-dir * 12,  8));
 
             if (visionMode == VisionMode::CircleSetup) {
-                p.setFont(QFont("Consolas", 13, QFont::Bold));
-                p.drawText(QPointF(16, 30), "DOPASOWANIE: przeciagnij = przesun, scroll = promien");
+                p.setFont(bannerFont);
+                p.drawText(QPointF(20, 44), "DOPASOWANIE: przeciagnij = przesun, scroll = promien");
             }
         } else if (visionMode == VisionMode::FlockingPreview) {
-            p.setPen(QPen(QColor(0, 255, 0), 2));
+            p.setPen(QPen(QColor(0, 255, 0), 3));
             p.setBrush(QColor(0, 255, 0));
-            p.setFont(QFont("Consolas", 10, QFont::Bold));
+            p.setFont(labelFont);
             for (const auto &b : flockingSim.getBoids()) {
                 cv::Point2d nPt = flockingSim.ownToNorm(b.x, b.y);
                 cv::Point2d nHead = flockingSim.ownToNorm(b.x + 14.0 * std::cos(b.theta),
                                                           b.y + 14.0 * std::sin(b.theta));
                 QPointF p0(nPt.x * lastFrameW, nPt.y * lastFrameH);
                 QPointF p1(nHead.x * lastFrameW, nHead.y * lastFrameH);
-                p.drawEllipse(p0, 7, 7);
+                p.drawEllipse(p0, 9, 9);
                 p.drawLine(p0, p1);
-                p.drawText(p0 + QPointF(9, -6), QString("B%1").arg(b.markerId));
+                p.drawText(p0 + QPointF(12, -8), QString("B%1").arg(b.markerId));
             }
-            p.setFont(QFont("Consolas", 13, QFont::Bold));
-            p.drawText(QPointF(16, 30), "PODGLAD LAWICY – MODEL A (bez robotow)");
+            p.setFont(bannerFont);
+            p.drawText(QPointF(20, 44), "PODGLAD LAWICY – MODEL A (bez robotow)");
         } else if (visionMode == VisionMode::FlockingRobots) {
-            p.setPen(QPen(QColor(255, 0, 255), 2));
+            p.setPen(QPen(QColor(255, 0, 255), 3));
             p.setBrush(QColor(255, 0, 255));
-            p.setFont(QFont("Consolas", 11, QFont::Bold));
+            p.setFont(labelFont);
             for (auto it = flockingRobotTargetsPx.constBegin(); it != flockingRobotTargetsPx.constEnd(); ++it) {
-                p.drawEllipse(it.value(), 8, 8);
-                p.drawText(it.value() + QPointF(9, 4), QString("T%1").arg(it.key()));
+                p.drawEllipse(it.value(), 9, 9);
+                p.drawText(it.value() + QPointF(11, 5), QString("T%1").arg(it.key()));
                 if (visionTracks.contains(it.key())) {
                     p.drawLine(QPointF(visionTracks[it.key()].centerX, visionTracks[it.key()].centerY), it.value());
                 }
@@ -1120,11 +1201,11 @@ void MainWindow::onCameraFrameReady(const QImage &rgbFrame, const QVector<Detect
 
         p.end();
 
-        videoLabel->setSourceSize(drawn.width(), drawn.height());
+        // Źródło kliknięć zawsze w oryginalnych współrzędnych pełnej klatki
+        videoLabel->setSourceSize(origW, origH);
         videoLabel->setPixmap(QPixmap::fromImage(drawn).scaled(
             videoLabel->size(), Qt::KeepAspectRatio, Qt::FastTransformation));
 
-        // Odświeżanie tabeli wizji maks. co 150 ms (~6-7 Hz) zamiast 30 razy/s
         if (now - lastVisionTableUpdateMs >= 150) {
             lastVisionTableUpdateMs = now;
             rebuildVisionTable();
@@ -1155,28 +1236,35 @@ void MainWindow::resetTrackMemory(VisionTrack &tr) {
     tr.hasPrevError = false;
 }
 
-bool MainWindow::driveMarkerToPoint(VisionTrack &tr, QPointF target, double speedCap, double pxScale) {
-    // Regulator PD ze skalowaniem względem rozdzielczości (z swarm_controller_2.py)
-    const double arrivalRadiusPx = 16.0 * pxScale;
-    const double slowdownRadiusPx = 220.0 * pxScale;
-    constexpr double MIN_MOVING_SPEED = 0.08;
-    constexpr double DRIVE_MAX_TURN = 0.25;
-    constexpr double FULL_TURN_DEG = 100.0;
-    constexpr double DEADBAND_DEG = 4.0;
-    constexpr double MAX_TURN_RATIO = 0.78;
-    constexpr double TURN_D_GAIN = 0.00055;
-    constexpr double ERR_RATE_TAU = 0.08;
-    constexpr double SPD_TAU = 0.18;
-    constexpr double TRN_TAU = 0.14;
+bool MainWindow::driveMarkerToPoint(VisionTrack &tr, QPointF target, double speedCap,
+                                    double pxScale, bool continuousMode) {
+    const double arrivalRadiusPx  = (continuousMode ? 10.0 : 16.0) * pxScale;
+    const double slowdownRadiusPx = (continuousMode ? 90.0 : 180.0) * pxScale;
+
+    // 0.17 (17% PWM) pokonuje tarcie statyczne PicoGo (wcześniejsze 0.08 powodowało zatrzymywanie!)
+    constexpr double MIN_MOVING_SPEED = 0.17;
+    constexpr double DRIVE_MAX_TURN   = 0.28;
+    constexpr double FULL_TURN_DEG    = 90.0;
+    constexpr double DEADBAND_DEG     = 3.5;
+    constexpr double MAX_TURN_RATIO   = 0.80;
+    constexpr double TURN_D_GAIN      = 0.00055;
+    constexpr double ERR_RATE_TAU     = 0.07;
+    constexpr double SPD_TAU          = 0.12;
+    constexpr double TRN_TAU          = 0.11;
 
     double dx = target.x() - tr.centerX;
     double dy = target.y() - tr.centerY;
     double dist = std::hypot(dx, dy);
 
     if (dist <= arrivalRadiusPx) {
-        sendVisionDriveCmd(tr.markerId, 0.0, 0.0);
-        resetTrackMemory(tr);
-        return true;
+        if (!continuousMode) {
+            sendVisionDriveCmd(tr.markerId, 0.0, 0.0);
+            resetTrackMemory(tr);
+            return true;
+        }
+        // W trybie ciągłym (ławica/okrąg) nie dajemy twardego STOP
+        sendVisionDriveCmd(tr.markerId, MIN_MOVING_SPEED, 0.0);
+        return false;
     }
 
     double desiredDeg = std::atan2(dy, dx) * 180.0 / kPi;
@@ -1185,9 +1273,9 @@ bool MainWindow::driveMarkerToPoint(VisionTrack &tr, QPointF target, double spee
 
     double distScale = (dist >= slowdownRadiusPx)
                            ? 1.0
-                           : (0.40 + 0.60 * std::clamp((dist - arrivalRadiusPx) / std::max(1.0, slowdownRadiusPx - arrivalRadiusPx), 0.0, 1.0));
+                           : (0.45 + 0.55 * std::clamp((dist - arrivalRadiusPx) / std::max(1.0, slowdownRadiusPx - arrivalRadiusPx), 0.0, 1.0));
     double headShape = 0.5 * (1.0 + std::cos(ae * kPi / 180.0));
-    double headScale = 0.68 + 0.32 * headShape;
+    double headScale = 0.65 + 0.35 * headShape;
 
     double speed = std::max(MIN_MOVING_SPEED, speedCap * distScale * headScale);
     int turnSign = comboTurnSign->currentData().toInt();
@@ -1201,7 +1289,6 @@ bool MainWindow::driveMarkerToPoint(VisionTrack &tr, QPointF target, double spee
     double dt = (tr.lastControlMs == 0) ? (1.0 / 30.0) : std::clamp((now - tr.lastControlMs) / 1000.0, 0.005, 0.2);
     tr.lastControlMs = now;
 
-    // Człon różniczkujący D tłumiący oscylacje
     if (tr.hasPrevError) {
         double rate = normalizeAngleDeg(error - tr.prevError) / dt;
         double aRate = 1.0 - std::exp(-dt / ERR_RATE_TAU);
@@ -1228,7 +1315,7 @@ void MainWindow::stepVisionControl(int frameW, int frameH) {
     if (visionMode == VisionMode::None || visionMode == VisionMode::CircleSetup) return;
     qint64 now = QDateTime::currentMSecsSinceEpoch();
 
-    // Skala pikseli względem referencji 6.75 px/cm (1080p bez zoomu w swarm_controller_2.py)
+    // Skala pikseli względem referencji 6.75 px/cm (1080p bez zoomu)
     double ppc = flockingSim.getArenaPxPerCm(frameW, frameH);
     double pxScale = (ppc > 0.1) ? std::clamp(ppc / 6.75, 0.3, 3.0) : (frameW / 1920.0);
 
@@ -1239,7 +1326,7 @@ void MainWindow::stepVisionControl(int frameW, int frameH) {
             sendVisionDriveCmd(selectedMarkerId, 0.0, 0.0);
             return;
         }
-        if (driveMarkerToPoint(tr, visionPointTarget, 0.36, pxScale)) {
+        if (driveMarkerToPoint(tr, visionPointTarget, 0.36, pxScale, false)) {
             visionMode = VisionMode::None;
             lblVisionStatus->setText(QString("Robot PICO_%1 dotarł do wskazanego celu!").arg(selectedMarkerId));
         }
@@ -1265,7 +1352,7 @@ void MainWindow::stepVisionControl(int frameW, int frameH) {
             figure8Index = (figure8Index + 1) % figure8Path.size();
         }
         visionPointTarget = figure8Path[figure8Index];
-        driveMarkerToPoint(tr, visionPointTarget, 0.36, pxScale);
+        driveMarkerToPoint(tr, visionPointTarget, 0.36, pxScale, true);
     } else if (visionMode == VisionMode::Circle) {
         int dir = comboCircleDir->currentData().toInt();
         for (auto it = visionTracks.begin(); it != visionTracks.end(); ++it) {
@@ -1280,44 +1367,43 @@ void MainWindow::stepVisionControl(int frameW, int frameH) {
             double targetPhi = phi + dir * (135.0 * pxScale / std::max(50.0, circleRadius));
             QPointF lookahead(circleCenter.x() + circleRadius * std::cos(targetPhi),
                               circleCenter.y() + circleRadius * std::sin(targetPhi));
-            driveMarkerToPoint(tr, lookahead, 0.25, pxScale);
+            driveMarkerToPoint(tr, lookahead, 0.28, pxScale, true);
         }
     } else if (visionMode == VisionMode::FlockingPreview) {
         double dt = (lastFlockingMs == 0) ? (1.0 / 30.0) : ((now - lastFlockingMs) / 1000.0);
         lastFlockingMs = now;
         flockingSim.step(dt);
     } else if (visionMode == VisionMode::FlockingRobots) {
-        // Bezpieczeństwo z swarm_controller_2.py: jeśli którykolwiek robot ławicy zniknął z kadru,
-        // zatrzymujemy wszystkie roboty i ZAMRAŻAMY czas symulacji (cele nie uciekają!).
         const auto &boids = flockingSim.getBoids();
-        bool anyMissing = false;
+
+        // Zbieramy bieżące pozycje widocznych robotów (tolerujemy krótkie mignięcia do 6 klatek)
+        std::map<int, cv::Point2d> realPosNorm;
         for (const auto &b : boids) {
-            if (!visionTracks.contains(b.markerId) ||
-                (now - visionTracks[b.markerId].lastSeenMs) > 450 ||
-                visionTracks[b.markerId].missedFrames > 3) {
-                anyMissing = true;
-                break;
+            if (visionTracks.contains(b.markerId)) {
+                const VisionTrack &vt = visionTracks[b.markerId];
+                if ((now - vt.lastSeenMs) <= 600 && vt.missedFrames <= 6) {
+                    realPosNorm[b.markerId] = cv::Point2d(vt.centerX / frameW, vt.centerY / frameH);
+                }
             }
-        }
-        if (anyMissing) {
-            for (const auto &b : boids) {
-                sendVisionDriveCmd(b.markerId, 0.0, 0.0);
-                if (visionTracks.contains(b.markerId)) resetTrackMemory(visionTracks[b.markerId]);
-            }
-            lastFlockingMs = 0;
-            return;
         }
 
         double dt = (lastFlockingMs == 0) ? (1.0 / 30.0) : ((now - lastFlockingMs) / 1000.0);
         lastFlockingMs = now;
 
-        auto targetsNorm = flockingSim.step(dt);
+        auto targetsNorm = flockingSim.step(dt, &realPosNorm);
         flockingRobotTargetsPx.clear();
 
         for (const auto &[mId, nPt] : targetsNorm) {
             QPointF tPx(nPt.x * frameW, nPt.y * frameH);
             flockingRobotTargetsPx[mId] = tPx;
-            driveMarkerToPoint(visionTracks[mId], tPx, 0.42, pxScale);
+
+            if (realPosNorm.find(mId) == realPosNorm.end()) {
+                // Zatrzymujemy wyłącznie zgubionego robota; reszta normalnie omija jego stojący boid
+                sendVisionDriveCmd(mId, 0.0, 0.0);
+                if (visionTracks.contains(mId)) resetTrackMemory(visionTracks[mId]);
+                continue;
+            }
+            driveMarkerToPoint(visionTracks[mId], tPx, 0.50, pxScale, true);
         }
     }
 }
@@ -1342,13 +1428,34 @@ void MainWindow::onVideoImageClicked(double x, double y) {
             lblVisionStatus->setText(
                 QString("Kalibracja areny (%1/4): kliknij %2 róg areny.").arg(n).arg(cornerNames[n - 1]));
         } else {
+            bool okW = false, okH = false;
+            double wCm = QInputDialog::getDouble(
+                this, "Wymiary areny (1/2)",
+                "Rzeczywista szerokość areny [cm] (od lewego górnego do prawego górnego rogu):",
+                spinArenaW->value(), 20.0, 2000.0, 1, &okW);
+            if (!okW) {
+                startArenaCalibration();
+                return;
+            }
+            double hCm = QInputDialog::getDouble(
+                this, "Wymiary areny (2/2)",
+                "Rzeczywista wysokość areny [cm] (od lewego górnego do lewego dolnego rogu):",
+                spinArenaH->value(), 20.0, 2000.0, 1, &okH);
+            if (!okH) {
+                startArenaCalibration();
+                return;
+            }
+
+            spinArenaW->blockSignals(true); spinArenaW->setValue(wCm); spinArenaW->blockSignals(false);
+            spinArenaH->blockSignals(true); spinArenaH->setValue(hCm); spinArenaH->blockSignals(false);
+
             std::array<cv::Point2f, 4> cornersN;
             for (int i = 0; i < 4; ++i) {
                 cornersN[i] = cv::Point2f(static_cast<float>(arenaClickPoints[i].x() / lastFrameW),
                                           static_cast<float>(arenaClickPoints[i].y() / lastFrameH));
             }
             std::string errMsg;
-            if (!flockingSim.configureArena(cornersN, spinArenaW->value(), spinArenaH->value(), &errMsg)) {
+            if (!flockingSim.configureArena(cornersN, wCm, hCm, &errMsg)) {
                 lblVisionStatus->setText("BŁĄD kalibracji: " + QString::fromStdString(errMsg) + " Spróbuj ponownie.");
                 arenaClickPoints.clear();
                 return;
@@ -1357,11 +1464,10 @@ void MainWindow::onVideoImageClicked(double x, double y) {
             arenaCalibrating = false;
             arenaClickPoints.clear();
             btnArenaCalib->setText("📐 Wyznacz arenę (4 rogi)");
+            updateCameraRoi();
             lblVisionStatus->setText(
                 QString("Zapisano kalibrację areny (%1 x %2 cm) w %3.")
-                    .arg(spinArenaW->value(), 0, 'f', 0)
-                    .arg(spinArenaH->value(), 0, 'f', 0)
-                    .arg(ARENA_FILENAME));
+                    .arg(wCm, 0, 'f', 1).arg(hCm, 0, 'f', 1).arg(ARENA_FILENAME));
         }
         return;
     }
@@ -1443,12 +1549,14 @@ void MainWindow::startArenaCalibration() {
         arenaCalibrating = false;
         arenaClickPoints.clear();
         btnArenaCalib->setText("📐 Wyznacz arenę (4 rogi)");
+        updateCameraRoi();
         lblVisionStatus->setText("Anulowano wyznaczanie areny.");
         return;
     }
     stopVisionAll();
     arenaCalibrating = true;
     arenaClickPoints.clear();
+    updateCameraRoi();
     btnArenaCalib->setText("✖ Anuluj arenę");
     lblVisionStatus->setText("Kalibracja areny (0/4): kliknij LEWY GÓRNY róg (kolejność: LG -> PG -> PD -> LD).");
 }
@@ -1459,6 +1567,7 @@ void MainWindow::updateFlockingParamsFromUi() {
     flockingSim.params.wSep = spinFlockSep->value();
     flockingSim.params.wAlign = spinFlockAlign->value();
     flockingSim.params.wCoh = spinFlockCoh->value();
+    flockingSim.params.maxLeadCm = spinMaxLeadCm->value();
     flockingSim.configureArena(flockingSim.getCornersNorm(), spinArenaW->value(), spinArenaH->value());
 }
 
@@ -1639,7 +1748,6 @@ void MainWindow::onDhcpReadyRead() {
     while (udpDhcpSocket->hasPendingDatagrams()) {
         QNetworkDatagram datagram = udpDhcpSocket->receiveDatagram();
 
-        // Korzystamy wyłącznie ze szybkiego cache (bez odpytywania Windows API przy każdym pakiecie)
         if (!cachedServerValid) continue;
         if (datagram.interfaceIndex() != 0 && static_cast<int>(datagram.interfaceIndex()) != cachedServerIfaceIdx)
             continue;
@@ -1775,7 +1883,6 @@ void MainWindow::onUdpReadyRead() {
             r.spd = p.value("spd").toDouble(r.spd);
         }
 
-        // Nowy robot tworzy wiersz natychmiast; aktualizacje komórek robi zbiorczy timer co 500 ms
         if (isNewInFleet) {
             ensureRobotRowExists(uid);
         }
@@ -1991,7 +2098,6 @@ void MainWindow::ensureRobotRowExists(const QString &uid) {
 }
 
 void MainWindow::refreshTableStatus() {
-    // Co 3 sekundy (co 6 wywołań po 500 ms) odświeżamy cache interfejsów sieciowych
     if (++netCacheTickCounter >= 6) {
         netCacheTickCounter = 0;
         updateNetworkCache();
@@ -2009,7 +2115,6 @@ void MainWindow::refreshTableStatus() {
         const RobotInfo &r = fleet[uid];
         if (r.selected) selectedCount++;
 
-        // Aktualizujemy tylko te komórki, których tekst faktycznie się zmienił
         auto setIfDiff = [&](int col, const QString &val) {
             QTableWidgetItem *it = fleetTable->item(row, col);
             if (it && it->text() != val) it->setText(val);

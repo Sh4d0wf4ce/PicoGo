@@ -23,7 +23,8 @@ struct FlockingParams {
     double angularAccelMaxRadS2 = 0.60;
 
     // Zmienna prędkość (robot nigdy się nie zatrzymuje, min. 30% V_max)
-    double speedMinFraction = 0.30;
+    double speedMinFraction = 0.45;
+    double maxLeadCm = 14.0;
     double linearAccelCmS2 = 10.0;
     double linearDecelCmS2 = 24.0;
     double minPathRadiusCm = 12.0;
@@ -315,10 +316,20 @@ public:
         }
     }
 
-    std::vector<std::pair<int, cv::Point2d>> step(double dt) {
+    std::vector<std::pair<int, cv::Point2d>> step(
+        double dt,
+        const std::map<int, cv::Point2d> *realPosNorm = nullptr) {
         dt = std::clamp(dt, 0.0, 0.25);
         std::vector<std::pair<int, cv::Point2d>> out;
         if (boids.empty()) return out;
+
+        // Przeliczenie aktualnych pozycji fizycznych robotów na układ areny [cm]
+        std::map<int, cv::Point2d> realOwn;
+        if (realPosNorm != nullptr) {
+            for (const auto &[mId, ptNorm] : *realPosNorm) {
+                realOwn[mId] = normToOwn(ptNorm.x, ptNorm.y);
+            }
+        }
 
         const size_t n = boids.size();
         const int steps = std::max(1, params.substeps);
@@ -335,17 +346,43 @@ public:
                 desired[i] = computeForces(i, pw);
             }
 
-            // 1. Zmienna prędkość (ściany + robot z przodu, min. SPEED_MIN_CM_S)
+            // 1. Zmienna prędkość + elastyczna smycz (kropka nie ucieka od fizycznego robota)
             const double vMin = speedMinCmS();
+            const double maxLead = std::max(5.0, params.maxLeadCm);
+            const double softLead = maxLead * 0.50;
+
             for (size_t i = 0; i < n; ++i) {
                 auto &v = boids[i];
+                double lagScale = 1.0;
+
+                if (realPosNorm != nullptr) {
+                    auto it = realOwn.find(v.markerId);
+                    if (it == realOwn.end()) {
+                        // Robot chwilowo zgubiony -> jego wirtualny boid staje, inne go omijają
+                        lagScale = 0.0;
+                    } else {
+                        double lag = std::hypot(v.x - it->second.x, v.y - it->second.y);
+                        if (lag > softLead) {
+                            lagScale = std::clamp((maxLead - lag) / std::max(1.0, maxLead - softLead), 0.0, 1.0);
+                        }
+                        // Awaryjne dociągnięcie tylko przy dużym poślizgu/przestawieniu robota ręką
+                        if (lag > maxLead * 2.2) {
+                            v.x += 0.08 * (it->second.x - v.x);
+                            v.y += 0.08 * (it->second.y - v.y);
+                            physicalWallBackstop(v);
+                        }
+                    }
+                }
+
                 double vWall = effectiveWallSpeedLimit(v);
                 double vRob = pw.robotSpeedLimit[i];
-                double vTarget = std::max(vMin, std::min({params.speedCmS, vWall, vRob}));
-                double dv = std::clamp(vTarget - v.speed,
-                                       -params.linearDecelCmS2 * subDt,
-                                        params.linearAccelCmS2 * subDt);
-                v.speed = std::clamp(v.speed + dv, vMin, params.speedCmS);
+                double vBase = std::max(vMin, std::min({params.speedCmS, vWall, vRob}));
+                double vTarget = vBase * lagScale;
+
+                double decel = (lagScale < 0.5) ? (params.linearDecelCmS2 * 2.0) : params.linearDecelCmS2;
+                double dv = std::clamp(vTarget - v.speed, -decel * subDt, params.linearAccelCmS2 * subDt);
+                double effectiveMin = (lagScale < 0.99) ? 0.0 : vMin;
+                v.speed = std::clamp(v.speed + dv, effectiveMin, params.speedCmS);
             }
 
             // 2. Fizycznie gładki skręt z ograniczonym przyspieszeniem kątowym
@@ -361,7 +398,6 @@ public:
                 v.theta = wrapAngle(v.theta + v.omega * subDt);
             }
 
-            // Zegary trybu narożnika
             for (auto &v : boids) {
                 if (v.cornerTurnSign != 0) v.cornerHoldS += subDt;
                 if (v.cornerCooldownS > 0.0) v.cornerCooldownS = std::max(0.0, v.cornerCooldownS - subDt);

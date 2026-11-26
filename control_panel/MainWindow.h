@@ -25,6 +25,9 @@
 #include <QPointF>
 #include <QDateTime>
 #include <QNetworkInterface>
+#include <QMutex>
+#include <QRectF>
+#include <map>
 #include <atomic>
 
 #include <opencv2/opencv.hpp>
@@ -53,11 +56,12 @@ public:
     void stopCapture();
     void markGuiReady() { guiBusy.store(false, std::memory_order_release); }
     void setDebugRejected(bool enabled) { debugRejected.store(enabled, std::memory_order_relaxed); }
+    void setArenaRoi(bool enabled, const QRectF &roiNorm);
 
 signals:
     void cameraOpened(const QString &infoText, int realW, int realH);
     void cameraError(const QString &errMsg);
-    void frameProcessed(const QImage &rgbFrame, const QVector<DetectedMarker> &markers, double fps);
+    void frameProcessed(const QImage &previewRgb, int origW, int origH,const QVector<DetectedMarker> &markers, double fps);
 
 protected:
     void run() override;
@@ -69,6 +73,9 @@ private:
     std::atomic<bool> running{false};
     std::atomic<bool> guiBusy{false};
     std::atomic<bool> debugRejected{false};
+    QMutex roiMutex;
+    bool useArenaRoi = false;
+    QRectF arenaRoiNorm;
 };
 
 class ClickableVideoLabel : public QLabel {
@@ -202,7 +209,7 @@ private slots:
     void toggleCamera();
     void onCameraOpened(const QString &infoText, int realW, int realH);
     void onCameraError(const QString &errMsg);
-    void onCameraFrameReady(const QImage &rgbFrame, const QVector<DetectedMarker> &markers, double fps);
+    void onCameraFrameReady(const QImage &previewRgb, int origW, int origH, const QVector<DetectedMarker> &markers, double fps);
     void onVideoImageClicked(double x, double y);
     void onVideoImageDragged(double x, double y);
     void onVideoWheelScrolled(int delta);
@@ -241,7 +248,8 @@ private:
     static int extractNumberFromName(const QString &name);
 
     void stepVisionControl(int frameW, int frameH);
-    bool driveMarkerToPoint(VisionTrack &tr, QPointF target, double speedCap, double pxScale);
+    bool driveMarkerToPoint(VisionTrack &tr, QPointF target, double speedCap, double pxScale, bool continuousMode = false);
+    void updateCameraRoi();
     void resetTrackMemory(VisionTrack &tr);
     static double normalizeAngleDeg(double a);
 
@@ -369,4 +377,7 @@ private:
     QVector<QPointF> arenaClickPoints;
     qint64 lastFlockingMs = 0;
     QMap<int, QPointF> flockingRobotTargetsPx;
+
+    QCheckBox *chkUseArenaRoi = nullptr;
+    QDoubleSpinBox *spinMaxLeadCm = nullptr;
 };
